@@ -25,11 +25,30 @@ class CachingService:
         self._data_cache: Dict[str, CachePayload] = {}
         self._resource_cache: Dict[str, CachePayload] = {}
 
-    def get_data(self, key: str, config: Dict[str, Any]) -> Optional[Any]:
-        """Returns cached dataset/intermediate data if still valid for the provided config."""
+    def get_data(
+        self,
+        key: str,
+        config: Dict[str, Any],
+        dataset_id: Optional[str] = None,
+        file_hash: Optional[str] = None,
+    ) -> Optional[Any]:
+        """Returns cached dataset/intermediate data if still valid for the provided config and state."""
         payload = self._data_cache.get(key)
-        if payload and payload.config_signature == self._hash_config(config):
+        if self._is_payload_valid(payload, config, dataset_id, file_hash):
             return payload.value
+        return None
+
+    def get_data_payload(
+        self,
+        key: str,
+        config: Dict[str, Any],
+        dataset_id: Optional[str] = None,
+        file_hash: Optional[str] = None,
+    ) -> Optional[CachePayload]:
+        """Returns the cached payload including metadata when the config and state still matches."""
+        payload = self._data_cache.get(key)
+        if self._is_payload_valid(payload, config, dataset_id, file_hash):
+            return payload
         return None
 
     def set_data(
@@ -50,10 +69,16 @@ class CachingService:
             cached_at=self._current_timestamp(),
         )
 
-    def get_resource(self, key: str, config: Dict[str, Any]) -> Optional[Any]:
-        """Returns cached model/resource if the configuration still matches."""
+    def get_resource(
+        self,
+        key: str,
+        config: Dict[str, Any],
+        dataset_id: Optional[str] = None,
+        file_hash: Optional[str] = None,
+    ) -> Optional[Any]:
+        """Returns cached model/resource if the configuration and state still matches."""
         payload = self._resource_cache.get(key)
-        if payload and payload.config_signature == self._hash_config(config):
+        if self._is_payload_valid(payload, config, dataset_id, file_hash):
             return payload.value
         return None
 
@@ -97,6 +122,23 @@ class CachingService:
             "extra": extra_signature,
         }
         return hashlib.sha256(json.dumps(digest_source, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+
+    def _is_payload_valid(
+        self,
+        payload: Optional[CachePayload],
+        config: Dict[str, Any],
+        dataset_id: Optional[str],
+        file_hash: Optional[str],
+    ) -> bool:
+        if not payload:
+            return False
+        if payload.config_signature != self._hash_config(config):
+            return False
+        if payload.dataset_id != dataset_id:
+            return False
+        if payload.file_hash != file_hash:
+            return False
+        return True
 
     def _hash_config(self, config: Dict[str, Any]) -> str:
         return hashlib.sha256(json.dumps(config, sort_keys=True, default=str).encode("utf-8")).hexdigest()
