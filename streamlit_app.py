@@ -213,6 +213,12 @@ MODEL_HYPERPARAMETER_TEMPLATES: Dict[str, List[Dict[str, Any]]] = {
 WORKFLOW_METRIC_OPTIONS = ["rmse", "mae", "mse", "r2", "accuracy"]
 WORKFLOW_EVALUATION_SCOPES = ["validation", "holdout", "production"]
 
+SIMULATION_NOTICE = (
+    "The optimization, comparison, and diagnostics sections currently show simulated data. "
+    "No real training is executed in this demo workspace. Use the dataset inputs and workflow cues "
+    "to validate config decisions before integrating with an actual ML pipeline."
+)
+
 
 def _format_ml_task_label(value: str) -> str:
     return ML_TASK_DISPLAY_NAMES.get(value, value.replace("_", " ").title())
@@ -657,6 +663,10 @@ def _ensure_workflow_session_state() -> None:
         st.session_state["workflow_last_evaluation"] = ""
 
 
+def _render_simulation_notice() -> None:
+    st.info(SIMULATION_NOTICE)
+
+
 def _simulate_workflow_response(
     selected_models: List[str],
     metrics: List[str],
@@ -737,6 +747,7 @@ def _render_workflow_results_panel() -> None:
     if not comparison and not evaluation:
         return
     st.header("Optimization & evaluation outputs")
+    _render_simulation_notice()
     if comparison:
         with st.expander("Model comparison summary", expanded=True):
             st.subheader("Metrics overview")
@@ -769,6 +780,7 @@ def _render_workflow_results_panel() -> None:
     if evaluation:
         with st.expander("Evaluation diagnostics", expanded=True):
             st.subheader(f"Scope: {evaluation['scope'].title()}")
+            st.caption("Evaluations are generated from synthetic predictions for this demo workspace.")
             st.json(evaluation["evaluation"])
             st.download_button(
                 "Download evaluation artifact",
@@ -796,7 +808,7 @@ def _handle_workflow_actions() -> None:
         scope, comparison_payload["models"]
     )
     st.session_state["workflow_last_run"] = datetime.utcnow().isoformat()
-    st.success("Optimization and comparison completed. Inspect the panel below for details.")
+    st.success("Optimization and comparison completed with simulated diagnostics. Interpret the summaries as previews, not as actual training outcomes.")
 
 
 def _refresh_evaluation_outputs() -> None:
@@ -807,7 +819,333 @@ def _refresh_evaluation_outputs() -> None:
     scope = st.session_state.get("workflow_evaluation_scope", WORKFLOW_EVALUATION_SCOPES[0])
     st.session_state["workflow_evaluation_artifact"] = _simulate_evaluation_artifact(scope, comparison["models"])
     st.session_state["workflow_last_evaluation"] = datetime.utcnow().isoformat()
-    st.success("Evaluation diagnostics refreshed.")
+    st.success("Evaluation diagnostics refreshed (simulated).")
+
+
+# Diagnostics helpers -----------------------------------------------------------------------------
+
+def _compute_curve_points(actual: np.ndarray, probs: np.ndarray) -> Dict[str, List[float]]:
+    thresholds = np.linspace(0.0, 1.0, 41)
+    fprs: List[float] = []
+    tprs: List[float] = []
+    precisions: List[float] = []
+    recalls: List[float] = []
+
+    positives = actual == 1
+    negatives = actual == 0
+
+    for threshold in thresholds:
+        predicted = (probs >= threshold).astype(int)
+        tp = np.sum(predicted[positives] == 1)
+        fp = np.sum(predicted[negatives] == 1)
+        tn = np.sum(predicted[negatives] == 0)
+        fn = np.sum(predicted[positives] == 0)
+
+        tpr = tp / (tp + fn) if (tp + fn) else 0.0
+        fpr = fp / (fp + tn) if (fp + tn) else 0.0
+        precision = tp / (tp + fp) if (tp + fp) else 1.0
+        recall = tpr
+
+        tprs.append(tpr)
+        fprs.append(fpr)
+        precisions.append(precision)
+        recalls.append(recall)
+
+    return {
+        "thresholds": thresholds.tolist(),
+        "fpr": fprs,
+        "tpr": tprs,
+        "precision": precisions,
+        "recall": recalls,
+    }
+
+
+@st.cache_resource
+def _get_model_diagnostics(model_name: str, task_type: str) -> Dict[str, Any]:
+    seed_value = abs(hash((model_name, task_type))) % (2 ** 32)
+    rng = np.random.default_rng(seed_value)
+    features = [f"feature_{i+1}" for i in range(6)]
+    raw_importances = np.abs(rng.normal(0.4, 0.2, len(features)))
+    normalized_importances = raw_importances / (raw_importances.sum() or 1)
+    feature_importance = pd.DataFrame(
+        {"feature": features, "importance": normalized_importances}
+    ).sort_values("importance", ascending=False)
+
+    sample_size = 200
+    if task_type == "classification":
+        actual = rng.integers(0, 2, sample_size)
+        predicted_probs = np.clip(rng.beta(2.2, 2.0, sample_size), 0, 1)
+        predicted_values = predicted_probs
+        thresholded_predictions = (predicted_probs >= 0.5).astype(int)
+    else:
+        actual = rng.normal(60, 12, sample_size)
+        predicted_values = actual + rng.normal(0, 5, sample_size)
+        predicted_probs = None
+        thresholded_predictions = (predicted_values >= actual.mean()).astype(int)
+
+    residuals = pd.DataFrame(
+        {
+            "index": np.arange(sample_size),
+            "actual": actual,
+            "predicted": predicted_values,
+            "residual": predicted_values - actual,
+        }
+    )
+
+    learning_sizes = np.linspace(0.1, 1.0, 8)
+    learning_curve = pd.DataFrame(
+        {
+            "training_size": (learning_sizes * 100).astype(int),
+            "training_score": np.clip(
+                np.linspace(0.62, 0.95, len(learning_sizes)) + rng.normal(0, 0.02, len(learning_sizes)),
+                0,
+                1,
+            ),
+            "validation_score": np.clip(
+                np.linspace(0.58, 0.9, len(learning_sizes)) + rng.normal(0, 0.02, len(learning_sizes)),
+                0,
+                1,
+            ),
+        }
+    )
+
+    param_range = np.linspace(1, 8, 8)
+    validation_curve = pd.DataFrame(
+        {
+            "param_value": np.round(param_range, 2),
+            "training_score": np.clip(
+                np.linspace(0.65, 0.96, len(param_range)) + rng.normal(0, 0.015, len(param_range)),
+                0,
+                1,
+            ),
+            "validation_score": np.clip(
+                np.linspace(0.6, 0.91, len(param_range)) + rng.normal(0, 0.015, len(param_range)),
+                0,
+                1,
+            ),
+        }
+    )
+
+    confusion_matrix = None
+    roc_data = None
+    precision_recall_data = None
+    if task_type == "classification":
+        diag = _compute_curve_points(actual, predicted_probs)
+        roc_data = {"fpr": diag["fpr"], "tpr": diag["tpr"]}
+        precision_recall_data = {"precision": diag["precision"], "recall": diag["recall"]}
+        tp = np.sum((thresholded_predictions == 1) & (actual == 1))
+        fn = np.sum((thresholded_predictions == 0) & (actual == 1))
+        fp = np.sum((thresholded_predictions == 1) & (actual == 0))
+        tn = np.sum((thresholded_predictions == 0) & (actual == 0))
+        confusion_matrix = pd.DataFrame(
+            {
+                "Pred=0": [tn, fn],
+                "Pred=1": [fp, tp],
+            },
+            index=["Actual=0", "Actual=1"],
+        )
+
+    return {
+        "feature_importance": feature_importance,
+        "residuals": residuals,
+        "learning_curve": learning_curve,
+        "validation_curve": validation_curve,
+        "roc": roc_data,
+        "precision_recall": precision_recall_data,
+        "confusion_matrix": confusion_matrix,
+        "task_type": task_type,
+    }
+
+
+def _render_feature_importance_chart(df: pd.DataFrame) -> None:
+    fig = px.bar(
+        df,
+        x="importance",
+        y="feature",
+        orientation="h",
+        title="Feature importance",
+        text_auto=".2f",
+    )
+    fig.update_layout(yaxis=dict(categoryorder="total ascending"))
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def _render_residual_chart(df: pd.DataFrame) -> None:
+    fig = px.scatter(
+        df,
+        x="predicted",
+        y="residual",
+        size_max=6,
+        hover_data={"index": True, "actual": True},
+        title="Residual diagnostics",
+    )
+    fig.add_hline(y=0, line_dash="dash", line_color="red")
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def _render_roc_chart(roc_data: Dict[str, List[float]]) -> None:
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=roc_data["fpr"],
+            y=roc_data["tpr"],
+            mode="lines+markers",
+            name="ROC",
+        )
+    )
+    fig.add_shape(
+        type="line",
+        x0=0,
+        x1=1,
+        y0=0,
+        y1=1,
+        line=dict(dash="dash", color="gray"),
+        name="Chance",
+    )
+    fig.update_layout(
+        title="ROC curve",
+        xaxis_title="False positive rate",
+        yaxis_title="True positive rate",
+        legend=dict(orientation="h"),
+        hovermode="closest",
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def _render_precision_recall_chart(data: Dict[str, List[float]]) -> None:
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=data["recall"],
+            y=data["precision"],
+            mode="lines+markers",
+            name="Precision-Recall",
+        )
+    )
+    fig.update_layout(
+        title="Precision-Recall curve",
+        xaxis_title="Recall",
+        yaxis_title="Precision",
+        hovermode="closest",
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def _render_confusion_matrix(confusion_matrix: pd.DataFrame) -> None:
+    fig = go.Figure(
+        data=go.Heatmap(
+            z=confusion_matrix.values,
+            x=confusion_matrix.columns.tolist(),
+            y=confusion_matrix.index.tolist(),
+            colorscale="Blues",
+            hoverongaps=False,
+            showscale=True,
+        )
+    )
+    fig.update_layout(title="Aggregated confusion matrix")
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def _render_learning_curve(chart_data: pd.DataFrame) -> None:
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=chart_data["training_size"],
+            y=chart_data["training_score"],
+            mode="lines+markers",
+            name="Training",
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=chart_data["training_size"],
+            y=chart_data["validation_score"],
+            mode="lines+markers",
+            name="Validation",
+        )
+    )
+    fig.update_layout(
+        xaxis_title="Training set size (%)",
+        yaxis_title="Score",
+        title="Learning curve",
+        legend=dict(orientation="h"),
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def _render_validation_curve(chart_data: pd.DataFrame) -> None:
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=chart_data["param_value"],
+            y=chart_data["training_score"],
+            mode="lines+markers",
+            name="Training",
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=chart_data["param_value"],
+            y=chart_data["validation_score"],
+            mode="lines+markers",
+            name="Validation",
+        )
+    )
+    fig.update_layout(
+        xaxis_title="Hyperparameter value",
+        yaxis_title="Score",
+        title="Validation curve",
+        legend=dict(orientation="h"),
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def _render_model_diagnostics_panel() -> None:
+    current_task = st.session_state.get("active_task_type", SUPPORTED_MODEL_TASKS[0])
+    selection_key = f"selected_models_{current_task}"
+    selected_models = st.session_state.get(selection_key, [])
+    st.header("Trained model diagnostics")
+    _render_simulation_notice()
+    if not selected_models:
+        st.info("Select and train at least one model to inspect diagnostics.")
+        return
+    for model_name in selected_models:
+        diag_data = _get_model_diagnostics(model_name, current_task)
+        st.subheader(f"{model_name.replace('_', ' ').title()} diagnostics")
+        tabs = st.tabs(
+            [
+                "Feature importance",
+                "Residual diagnostics",
+                "ROC curve",
+                "Precision-Recall",
+                "Confusion matrix",
+                "Learning curve",
+                "Validation curve",
+            ]
+        )
+        with tabs[0]:
+            _render_feature_importance_chart(diag_data["feature_importance"])
+        with tabs[1]:
+            _render_residual_chart(diag_data["residuals"])
+        with tabs[2]:
+            if diag_data["roc"]:
+                _render_roc_chart(diag_data["roc"])
+            else:
+                st.info("ROC curve is available for classification tasks only.")
+        with tabs[3]:
+            if diag_data["precision_recall"]:
+                _render_precision_recall_chart(diag_data["precision_recall"])
+            else:
+                st.info("Precision-recall curve is only available for classification tasks.")
+        with tabs[4]:
+            if diag_data["confusion_matrix"] is not None:
+                _render_confusion_matrix(diag_data["confusion_matrix"])
+            else:
+                st.info("Confusion matrix requires discrete prediction outputs, e.g., classification models.")
+        with tabs[5]:
+            _render_learning_curve(diag_data["learning_curve"])
+        with tabs[6]:
+            _render_validation_curve(diag_data["validation_curve"])
 
 
 # Additional UI initialization for model configuration
@@ -839,3 +1177,4 @@ with st.sidebar.expander("Optimization & evaluation workflow", expanded=True):
         _refresh_evaluation_outputs()
 
 _render_workflow_results_panel()
+_render_model_diagnostics_panel()
