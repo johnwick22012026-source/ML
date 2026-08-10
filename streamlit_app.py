@@ -6,8 +6,11 @@ from typing import Any, Dict, Optional
 
 import numpy as np
 import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
 import streamlit as st
 
+from backend.eda import EDAService
 from backend.services.dataset_inspection import DatasetInspectionResult, inspect_dataset
 from backend.services.ingestion import (
     DatasetState,
@@ -153,6 +156,8 @@ PREPROCESSING_OPTIONS = {
     "encoding": ENCODING_STRATEGIES,
     "scaling": SCALING_STRATEGIES,
 }
+
+EDA_VIEW_CHOICES = ["Original dataset", "Validation preview"]
 
 
 def _generate_sample_frame() -> pd.DataFrame:
@@ -344,6 +349,19 @@ def _coerce_scalar_value(raw: str) -> Optional[Any]:
     return normalized
 
 
+def _ensure_preprocessing_session_state() -> None:
+    for section, default_strategy in PREPROCESSING_DEFAULT_STRATEGIES.items():
+        session_key = PREPROCESSING_SESSION_KEYS[section]
+        if session_key not in st.session_state:
+            st.session_state[session_key] = default_strategy
+        label_key = f"preprocessing_label_override_{section}"
+        if label_key not in st.session_state:
+            st.session_state[label_key] = PREPROCESSING_LABEL_DEFAULTS[section]
+        default_key = f"preprocessing_default_{section}"
+        if default_key not in st.session_state:
+            st.session_state[default_key] = default_strategy
+
+
 def _ensure_feature_engineering_session_state() -> None:
     for key, default in FEATURE_ENGINEERING_DEFAULTS.items():
         if key not in st.session_state:
@@ -527,26 +545,175 @@ def _clear_role_configuration() -> None:
     st.session_state["dataset_config"] = {"column_roles": {}, "available_columns": []}
 
 
-def _update_session_state(state: Optional[DatasetState], reset_roles: bool = False) -> None:
-    st.session_state["dataset_state"] = state
-    _refresh_inspection(state)
-    if reset_roles or state is None:
-        _clear_role_configuration()
-    _reset_validation_state()
+def _initialize_eda_session_state() -> None:
+    if "eda_result" not in st.session_state:
+        st.session_state["eda_result"] = None
+    if "eda_error" not in st.session_state:
+        st.session_state["eda_error"] = ""
+    if "eda_last_run_time" not in st.session_state:
+        st.session_state["eda_last_run_time"] = ""
+    if "eda_scatter_pairs" not in st.session_state:
+        st.session_state["eda_scatter_pairs"] = []
+    if "eda_active_view" not in st.session_state:
+        st.session_state["eda_active_view"] = EDA_VIEW_CHOICES[0]
 
 
-def _ensure_preprocessing_session_state() -> None:
-    for section, label in PREPROCESSING_LABEL_DEFAULTS.items():
-        label_key = f"preprocessing_label_override_{section}"
-        if label_key not in st.session_state:
-            st.session_state[label_key] = label
-    for section, default_value in PREPROCESSING_DEFAULT_STRATEGIES.items():
-        default_key = f"preprocessing_default_{section}"
-        if default_key not in st.session_state:
-            st.session_state[default_key] = default_value
-        selector_key = PREPROCESSING_SESSION_KEYS[section]
-        if selector_key not in st.session_state:
-            st.session_state[selector_key] = default_value
+def _reset_eda_state() -> None:
+    st.session_state["eda_result"] = None
+    st.session_state["eda_error"] = ""
+    st.session_state["eda_last_run_time"] = ""
+    st.session_state["eda_scatter_pairs"] = []
+    st.session_state["eda_active_view"] = EDA_VIEW_CHOICES[0]
+
+
+def _get_dataframe_from_state(state: Optional[DatasetState]) -> Optional[pd.DataFrame]:
+    if not state:
+        return None
+    df = getattr(state, "dataframe", None)
+    if isinstance(df, pd.DataFrame):
+        return df.copy()
+    if hasattr(df, "to_pandas"):
+        try:
+            return df.to_pandas()
+        except Exception:
+            pass
+    if isinstance(df, dict):
+        return pd.DataFrame(df)
+    return None
+
+
+def _get_dataframe_for_view(
+    state: Optional[DatasetState],
+    view: str,
+    validation_result: Optional[DatasetValidationResult],
+) -> Optional[pd.DataFrame]:
+    if view == "Validation preview" and validation_result:
+        preview_records = validation_result.preview.get("records", [])
+        preview_columns = validation_result.preview.get("columns", [])
+        if preview_records:
+            try:
+                df = pd.DataFrame(preview_records)
+                if preview_columns:
+                    df = df[preview_columns]
+                return df
+            except Exception:
+                pass
+    return _get_dataframe_from_state(state)
+
+
+def _build_eda_config() -> Dict[str, Any]:
+    hist_columns = st.session_state.get("eda_hist_columns", [])
+    kde_columns = st.session_state.get("eda_kde_columns", [])
+    box_columns = st.session_state.get("eda_box_columns", [])
+    pair_columns = st.session_state.get("eda_pair_columns", [])
+    scatter_pairs = st.session_state.get("eda_scatter_pairs", [])
+    correlation_columns = st.session_state.get("eda_correlation_columns", [])
+    correlation_method = st.session_state.get("eda_correlation_method", "pearson")
+
+    return {
+        "histogram": {"columns": hist_columns},
+        "kde": {"columns": kde_columns},
+        "boxplot": {"columns": box_columns},
+        "pair_plot": {"columns": pair_columns},
+        "scatter": {"pairs": scatter_pairs},
+        "correlation": {"columns": correlation_columns, "method": correlation_method},
+    }
+
+
+def _run_eda(df: pd.DataFrame) -> Dict[str, Any]:
+    config = _build_eda_config()
+    service = EDAService()
+    return service.analyze(df, config)
+
+
+def _render_histogram(hist_data: Dict[str, Dict[str, list[float]]]) -> None:
+    for column, payload in hist_data.items():
+        bins = payload.get("bins", [])
+        counts = payload.get("counts", [])
+        if not bins or not counts:
+            continue
+        bin_centers = [float((bins[i] + bins[i + 1]) / 2) for i in range(len(bins) - 1)]
+        fig = go.Figure(
+            data=go.Bar(x=bin_centers, y=counts, marker_color="#636EFA"),
+            layout=go.Layout(
+                title=f"Histogram — {column}",
+                xaxis_title=column,
+                yaxis_title="Frequency",
+                template="plotly_white",
+            ),
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+
+def _render_kde(kde_data: Dict[str, Dict[str, list[float]]]) -> None:
+    for column, payload in kde_data.items():
+        fig = go.Figure(
+            data=go.Scatter(x=payload.get("x", []), y=payload.get("y", []), mode="lines", fill="tozeroy"),
+            layout=go.Layout(
+                title=f"KDE — {column}",
+                xaxis_title=column,
+                yaxis_title="Density",
+                template="plotly_white",
+            ),
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+
+def _render_boxplots(df: pd.DataFrame, columns: list[str]) -> None:
+    if not columns:
+        return
+    fig = px.box(df[columns], points="outliers", template="plotly_white")
+    fig.update_layout(title_text="Boxplots", xaxis_title="Columns", yaxis_title="Values")
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def _render_scatterplots(scatter_data: Dict[str, Dict[str, list[Any]]]) -> None:
+    for key, payload in scatter_data.items():
+        fig = px.scatter(
+            x=payload.get("x", []),
+            y=payload.get("y", []),
+            labels={"x": payload.get("x_label", "x"), "y": payload.get("y_label", "y")},
+            title=f"Scatter — {payload.get('x_label')} vs {payload.get('y_label')}",
+            template="plotly_white",
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+
+def _render_correlation(matrix_payload: Dict[str, Any]) -> None:
+    columns = matrix_payload.get("columns", [])
+    matrix = matrix_payload.get("matrix", [])
+    if not columns or not matrix:
+        return
+    fig = go.Figure(
+        data=go.Heatmap(
+            z=matrix,
+            x=columns,
+            y=columns,
+            colorscale="RdBu",
+            zmin=-1,
+            zmax=1,
+            colorbar=dict(title="r"),
+        ),
+        layout=go.Layout(title=f"Correlation — method: {matrix_payload.get('method')}", template="plotly_white"),
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def _render_pair_plot(pair_payload: Dict[str, Any]) -> None:
+    columns = pair_payload.get("columns", [])
+    data = pair_payload.get("data", {})
+    if not columns or not data:
+        return
+    df = pd.DataFrame(data)
+    if df.empty:
+        return
+    fig = px.scatter_matrix(df[columns], dimensions=columns, template="plotly_white")
+    fig.update_layout(title_text="Pair plot", dragmode="select")
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def _clear_pair_selection() -> None:
+    st.session_state["eda_scatter_pairs"] = []
 
 
 if "dataset_state" not in st.session_state:
@@ -560,6 +727,16 @@ if "dataset_state" not in st.session_state:
 
 _ensure_preprocessing_session_state()
 _ensure_feature_engineering_session_state()
+_initialize_eda_session_state()
+
+
+def _update_session_state(state: Optional[DatasetState], reset_roles: bool = False) -> None:
+    st.session_state["dataset_state"] = state
+    _refresh_inspection(state)
+    if reset_roles or state is None:
+        _clear_role_configuration()
+    _reset_validation_state()
+    _reset_eda_state()
 
 st.title("📊 Dataset Workspace")
 dataset_columns_for_payload = []
@@ -1027,3 +1204,118 @@ with analysis_section:
     st.markdown("---")
     st.markdown("### Future analysis controls")
     st.caption("This area will separate dataset management from later modeling, forecasting, or reporting controls.")
+
+with st.container():
+    st.markdown("---")
+    st.markdown("### Exploratory Data Analysis")
+    st.caption("Trigger in-memory EDA runs and interactively inspect distributions, correlations, and relationships for the current dataset view.")
+
+    view_options = [EDA_VIEW_CHOICES[0]]
+    if validation_result and validation_result.preview.get("records"):
+        view_options.append("Validation preview")
+    active_view = st.selectbox(
+        "Active data view",
+        options=view_options,
+        key="eda_active_view",
+    )
+
+    df_for_eda = _get_dataframe_for_view(state, active_view, validation_result)
+    if df_for_eda is None or df_for_eda.empty:
+        st.warning("Upload or reload a dataset and ensure the selected view contains rows before generating EDA.")
+    else:
+        numeric_columns = df_for_eda.select_dtypes(include="number").columns.tolist()
+        default_columns = numeric_columns[: min(3, len(numeric_columns))]
+        st.multiselect(
+            "Columns to include in histograms",
+            options=df_for_eda.columns.tolist(),
+            default=st.session_state.get("eda_hist_columns", default_columns),
+            key="eda_hist_columns",
+        )
+        st.multiselect(
+            "Columns to include in KDE plots",
+            options=df_for_eda.columns.tolist(),
+            default=st.session_state.get("eda_kde_columns", default_columns),
+            key="eda_kde_columns",
+        )
+        st.multiselect(
+            "Columns for boxplots",
+            options=df_for_eda.columns.tolist(),
+            default=st.session_state.get("eda_box_columns", default_columns),
+            key="eda_box_columns",
+        )
+        st.multiselect(
+            "Columns for pair plot",
+            options=df_for_eda.columns.tolist(),
+            default=st.session_state.get("eda_pair_columns", default_columns),
+            key="eda_pair_columns",
+        )
+        column_options = df_for_eda.columns.tolist()
+        scatter_x = st.selectbox("Scatter X-axis", options=column_options, key="eda_scatter_x")
+        scatter_y = st.selectbox("Scatter Y-axis", options=column_options, key="eda_scatter_y")
+        pair_cols = st.session_state.get("eda_scatter_pairs", [])
+        scatter_controls = st.columns([2, 1, 1])
+        with scatter_controls[1]:
+            if st.button("Add scatter pair"):
+                if scatter_x and scatter_y and scatter_x != scatter_y:
+                    new_pair = (scatter_x, scatter_y)
+                    if new_pair not in st.session_state["eda_scatter_pairs"]:
+                        st.session_state["eda_scatter_pairs"].append(new_pair)
+        with scatter_controls[2]:
+            if st.button("Clear scatter pairs"):
+                _clear_pair_selection()
+        if st.session_state.get("eda_scatter_pairs"):
+            st.caption(f"Active scatter pairings: {st.session_state['eda_scatter_pairs']}")
+        st.multiselect(
+            "Columns to include in correlation matrix",
+            options=df_for_eda.columns.tolist(),
+            default=st.session_state.get("eda_correlation_columns", default_columns),
+            key="eda_correlation_columns",
+        )
+        st.selectbox(
+            "Correlation method",
+            options=["pearson", "spearman", "kendall"],
+            index=["pearson", "spearman", "kendall"].index(
+                st.session_state.get("eda_correlation_method", "pearson")
+            ),
+            key="eda_correlation_method",
+        )
+
+        run_disabled = df_for_eda is None or df_for_eda.empty
+        button_label = "Generate exploratory analysis"
+        if st.button(button_label, disabled=run_disabled, key="eda_run"):
+            try:
+                with st.spinner("Hydrating EDA artifacts..."):
+                    eda_payload = _run_eda(df_for_eda)
+                st.session_state["eda_result"] = eda_payload
+                st.session_state["eda_error"] = ""
+                st.session_state["eda_last_run_time"] = datetime.utcnow().isoformat()
+                st.success("Exploratory analysis complete — charts are ready below.")
+            except Exception as exc:
+                st.session_state["eda_error"] = f"EDA failed: {exc}"
+                st.session_state["eda_result"] = None
+        if st.session_state.get("eda_error"):
+            st.error(st.session_state.get("eda_error"))
+        if st.session_state.get("eda_last_run_time"):
+            st.caption(f"Last EDA run: {st.session_state.get('eda_last_run_time')}")
+
+        eda_result = st.session_state.get("eda_result")
+        if eda_result:
+            st.markdown("#### Numerical summary & missing values")
+            numerical_summary = eda_result.get("numerical_summary", {})
+            st.write(numerical_summary)
+            st.markdown("#### Histograms")
+            _render_histogram(eda_result.get("histograms", {}))
+            st.markdown("#### KDE plots")
+            _render_kde(eda_result.get("kde", {}))
+            st.markdown("#### Boxplots")
+            _render_boxplots(df_for_eda, st.session_state.get("eda_box_columns", default_columns))
+            st.markdown("#### Scatterplots")
+            _render_scatterplots(eda_result.get("scatterplots", {}))
+            st.markdown("#### Correlation matrix")
+            _render_correlation(eda_result.get("correlation_matrix", {}))
+            st.markdown("#### Pair plot")
+            _render_pair_plot(eda_result.get("pair_plot_data", {}))
+        else:
+            st.info("Generate EDA to unlock all visualization panels.")
+    if active_view == "Validation preview" and not (validation_result and validation_result.preview.get("records")):
+        st.warning("Validation preview is not populated — switch to another view or run validation first.")
