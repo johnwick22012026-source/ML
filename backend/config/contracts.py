@@ -75,8 +75,91 @@ class PreprocessingConfig:
 
 
 @dataclass
+class PolynomialFeatureEngineeringConfig:
+    enabled: bool = False
+    columns: List[str] = field(default_factory=list)
+    degree: int = 2
+    include_bias: bool = False
+    interaction_only: bool = False
+
+
+@dataclass
+class InteractionFeatureEngineeringConfig:
+    enabled: bool = False
+    columns: List[str] = field(default_factory=list)
+
+
+@dataclass
+class LagFeatureEngineeringConfig:
+    enabled: bool = False
+    columns: List[str] = field(default_factory=list)
+    max_lag: int = 1
+    fill_value: Optional[Any] = None
+
+
+@dataclass
+class RollingStatsFeatureEngineeringConfig:
+    enabled: bool = False
+    columns: List[str] = field(default_factory=list)
+    windows: List[int] = field(default_factory=lambda: [3])
+    stats: List[str] = field(default_factory=lambda: ["mean"])
+
+
+@dataclass
+class DateFeatureEngineeringConfig:
+    enabled: bool = False
+    column: Optional[str] = None
+    features: List[str] = field(default_factory=lambda: ["year", "month", "day"])
+    drop_original: bool = False
+
+
+@dataclass
+class HolidayFeatureEngineeringConfig:
+    enabled: bool = False
+    column: Optional[str] = None
+    holidays: List[str] = field(default_factory=list)
+
+
+@dataclass
+class CyclicalFeatureEngineeringConfig:
+    enabled: bool = False
+    columns: List[str] = field(default_factory=list)
+    max_values: Dict[str, int] = field(default_factory=dict)
+
+
+@dataclass
+class PCAFeatureEngineeringConfig:
+    enabled: bool = False
+    columns: List[str] = field(default_factory=list)
+    n_components: Optional[int] = None
+    whiten: bool = False
+
+
+@dataclass
+class FeatureEngineeringSelectionConfig:
+    enabled: bool = False
+    method: str = "variance"
+    top_k: Optional[int] = None
+    threshold: float = 0.0
+    columns: List[str] = field(default_factory=list)
+
+
+@dataclass
 class FeatureEngineeringConfig:
     enabled: bool = True
+    polynomial: PolynomialFeatureEngineeringConfig = field(default_factory=PolynomialFeatureEngineeringConfig)
+    interaction: InteractionFeatureEngineeringConfig = field(
+        default_factory=InteractionFeatureEngineeringConfig
+    )
+    lag: LagFeatureEngineeringConfig = field(default_factory=LagFeatureEngineeringConfig)
+    rolling: RollingStatsFeatureEngineeringConfig = field(default_factory=RollingStatsFeatureEngineeringConfig)
+    date: DateFeatureEngineeringConfig = field(default_factory=DateFeatureEngineeringConfig)
+    holiday: HolidayFeatureEngineeringConfig = field(default_factory=HolidayFeatureEngineeringConfig)
+    cyclical: CyclicalFeatureEngineeringConfig = field(default_factory=CyclicalFeatureEngineeringConfig)
+    pca: PCAFeatureEngineeringConfig = field(default_factory=PCAFeatureEngineeringConfig)
+    feature_selection: FeatureEngineeringSelectionConfig = field(
+        default_factory=FeatureEngineeringSelectionConfig
+    )
     derived_fields: List[str] = field(default_factory=list)
     default_value: Any = None
 
