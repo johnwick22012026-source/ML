@@ -16,6 +16,7 @@ from backend.services.ingestion import (
     remove_dataset,
     replace_dataset,
 )
+from backend.validation.dataset_validation import DatasetValidationResult, DatasetValidationService
 
 
 st.set_page_config(page_title="Dataset Workspace", layout="wide")
@@ -482,10 +483,31 @@ def _reset_preprocessing_tracking() -> None:
     st.session_state["preprocessing_last_run_time"] = ""
 
 
+def _reset_validation_state() -> None:
+    st.session_state["dataset_validation_result"] = None
+    st.session_state["validation_error"] = ""
+
+
+def _run_validation_flow(state: DatasetState) -> None:
+    service = DatasetValidationService()
+    try:
+        validation_result = service.validate(
+            file_name=state.file_name,
+            file_bytes=state.file_bytes,
+            config=DEFAULT_INGEST_CONFIG,
+        )
+        st.session_state["dataset_validation_result"] = validation_result
+        st.session_state["validation_error"] = ""
+    except Exception as exc:
+        st.session_state["dataset_validation_result"] = None
+        st.session_state["validation_error"] = f"Validation failed: {exc}"
+
+
 def _refresh_inspection(state: Optional[DatasetState]) -> None:
     if not state:
         st.session_state["dataset_inspection"] = None
         st.session_state["inspection_error"] = ""
+        _reset_validation_state()
         return
     try:
         st.session_state["dataset_inspection"] = inspect_dataset(DATASET_ID, config=DEFAULT_INGEST_CONFIG)
@@ -493,6 +515,8 @@ def _refresh_inspection(state: Optional[DatasetState]) -> None:
     except Exception as exc:
         st.session_state["dataset_inspection"] = None
         st.session_state["inspection_error"] = f"Failed to inspect dataset: {exc}"
+        st.session_state["dataset_validation_result"] = None
+        st.session_state["validation_error"] = ""
 
 
 def _clear_role_configuration() -> None:
@@ -508,6 +532,7 @@ def _update_session_state(state: Optional[DatasetState], reset_roles: bool = Fal
     _refresh_inspection(state)
     if reset_roles or state is None:
         _clear_role_configuration()
+    _reset_validation_state()
 
 
 def _ensure_preprocessing_session_state() -> None:
@@ -531,12 +556,12 @@ if "dataset_state" not in st.session_state:
     st.session_state["dataset_config"] = {"column_roles": {}, "available_columns": []}
     st.session_state["dataset_display_name"] = ""
     _reset_preprocessing_tracking()
+    _reset_validation_state()
 
 _ensure_preprocessing_session_state()
 _ensure_feature_engineering_session_state()
 
 st.title("📊 Dataset Workspace")
-
 dataset_columns_for_payload = []
 
 with st.container():
@@ -658,8 +683,90 @@ st.markdown("---")
 state = st.session_state["dataset_state"]
 inspection = st.session_state["dataset_inspection"]
 inspection_error = st.session_state["inspection_error"]
+validation_result = st.session_state.get("dataset_validation_result")
+validation_error = st.session_state.get("validation_error", "")
 
 dataset_columns = _extract_dataframe_columns(state)
+
+with st.container():
+    st.markdown("### Dataset validation")
+    st.caption("Trigger validation to surface preview, schema, quality metrics, and actionable scores before modeling.")
+    validation_col1, validation_col2 = st.columns([2, 1])
+    with validation_col1:
+        if st.button("Validate Dataset", disabled=not state):
+            if not state:
+                st.warning("Load or upload a dataset before validating.")
+            else:
+                _run_validation_flow(state)
+                if st.session_state.get("dataset_validation_result"):
+                    st.success("Dataset validation completed and cached for this run.")
+    with validation_col2:
+        if validation_error:
+            st.error(validation_error)
+        elif validation_result:
+            st.success("Latest validation run available below.")
+        else:
+            st.info("Run validation to inspect dataset health indicators.")
+
+    if validation_result:
+        st.markdown("#### Preview")
+        preview_columns = validation_result.preview.get("columns", [])
+        preview_records = validation_result.preview.get("records", [])
+        if preview_records:
+            preview_df = pd.DataFrame(preview_records)
+            st.dataframe(preview_df[preview_columns], use_container_width=True)
+        else:
+            st.info("No rows available in the preview.")
+
+        st.markdown("#### Schema & Dtypes")
+        schema_df = pd.DataFrame(validation_result.schema)
+        st.dataframe(schema_df, use_container_width=True)
+        dtype_summary = validation_result.dtype_summary
+        st.markdown("#### Dimension & Memory Signature")
+        metrics_row = st.columns(4)
+        metrics_row[0].metric("Rows", validation_result.dimensions.get("rows", 0))
+        metrics_row[1].metric("Columns", validation_result.dimensions.get("columns", 0))
+        metrics_row[2].metric("Memory (MB)", f"{validation_result.memory_usage_bytes / (1024**2):.2f}")
+        metrics_row[3].metric("Quality score", f"{validation_result.quality_score * 100:.1f}%")
+
+        st.markdown("#### Type distribution")
+        dtype_items = [{"dtype": key, "count": value} for key, value in dtype_summary.items()]
+        dtype_df = pd.DataFrame(dtype_items)
+        st.bar_chart(dtype_df.set_index("dtype"))
+
+        st.markdown("#### Missing & Duplicate insights")
+        insights_col1, insights_col2 = st.columns(2)
+        total_missing = validation_result.total_missing_values
+        duplicate_count = validation_result.duplicate_row_count
+        insights_col1.metric("Total missing values", total_missing)
+        insights_col1.dataframe(
+            pd.DataFrame.from_dict(validation_result.missing_value_counts, orient="index", columns=["missing"])
+            .sort_values("missing", ascending=False)
+            .head(10),
+            use_container_width=True,
+        )
+        insights_col2.metric("Duplicate rows", duplicate_count)
+        quality_inputs = validation_result.quality_score_inputs
+        insights_col2.write(
+            {
+                "missing ratio": f"{quality_inputs.missing_ratio:.3f}",
+                "duplicate ratio": f"{quality_inputs.duplicate_ratio:.3f}",
+                "rows": quality_inputs.rows,
+                "columns": quality_inputs.columns,
+            }
+        )
+
+        metadata = validation_result.metadata
+        with st.expander("Validation metadata", expanded=False):
+            st.write({
+                "payload version": metadata.payload_version,
+                "file hash": metadata.file_hash,
+                "config signature": metadata.config_signature,
+                "cache key": metadata.cache_key,
+                "generated at": metadata.generated_at,
+            })
+    elif inspection_error:
+        st.warning("Dataset inspection is lagging due to the following error. Load or validate a dataset once the issue is resolved.")
 
 st.markdown("---")
 
