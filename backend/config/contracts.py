@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field, fields, is_dataclass
-from typing import Any, Dict, List, Optional, Type, get_args, get_origin
+from typing import Any, Dict, List, Optional, Type, Union, get_args, get_origin
 
 
 @dataclass
@@ -12,8 +12,63 @@ class SeedConfig:
 
 
 @dataclass
+class DataSettingsConfig:
+    dataset_id: Optional[str] = None
+    source: str = "memory"
+    target_columns: List[str] = field(default_factory=list)
+    index_columns: List[str] = field(default_factory=list)
+
+
+@dataclass
+class MissingValueConfig:
+    strategy: str = "none"
+    fill_value: Optional[Any] = None
+    n_neighbors: int = 5
+    max_iter: int = 10
+    tol: float = 1e-3
+    how: str = "any"
+
+
+@dataclass
+class OutlierConfig:
+    method: str = "none"
+    k: float = 1.5
+    threshold: float = 3.0
+    seed: int = 42
+    n_neighbors: int = 20
+    lower: float = 0.01
+    upper: float = 0.99
+
+
+@dataclass
+class EncodingConfig:
+    strategy: str = "none"
+    drop: Optional[str] = None
+    handle_unknown: str = "ignore"
+
+
+@dataclass
+class ScalingConfig:
+    strategy: str = "none"
+
+
+@dataclass
+class FeatureSelectionConfig:
+    method: str = "none"
+    top_k: Optional[int] = None
+    threshold: Optional[float] = None
+    columns: List[str] = field(default_factory=list)
+
+
+@dataclass
 class PreprocessingConfig:
     enabled: bool = True
+    data_settings: DataSettingsConfig = field(default_factory=DataSettingsConfig)
+    missing_value: MissingValueConfig = field(default_factory=MissingValueConfig)
+    outlier: OutlierConfig = field(default_factory=OutlierConfig)
+    encoding: EncodingConfig = field(default_factory=EncodingConfig)
+    scaling: ScalingConfig = field(default_factory=ScalingConfig)
+    feature_selection: FeatureSelectionConfig = field(default_factory=FeatureSelectionConfig)
     filters: List[str] = field(default_factory=list)
     derived_fields: List[str] = field(default_factory=list)
     default_value: Any = None
@@ -77,6 +132,16 @@ class RuntimeConfig:
     metadata: Dict[str, Any] = field(default_factory=dict)
 
 
+def _unwrap_optional(annotation: Any) -> Any:
+    """Return the non-None type behind Optional/Union annotations."""
+    origin = get_origin(annotation)
+    if origin is Union:
+        args = [arg for arg in get_args(annotation) if arg is not type(None)]
+        if len(args) == 1:
+            return args[0]
+    return annotation
+
+
 def build_section(cls: Type[Any], overrides: Optional[Dict[str, Any]] = None) -> Any:
     """
     Recursively build a dataclass section from overrides, enforcing nested contracts.
@@ -91,15 +156,7 @@ def build_section(cls: Type[Any], overrides: Optional[Dict[str, Any]] = None) ->
         if f.name not in overrides:
             continue
         value = overrides[f.name]
-        # Determine the actual type, handling Optional[T]
-        field_type = f.type
-        origin = get_origin(field_type)
-        args = get_args(field_type)
-        # Unwrap Optional
-        if origin is Optional and len(args) == 1:
-            inner_type = args[0]
-        else:
-            inner_type = field_type
+        inner_type = _unwrap_optional(f.type)
         # If it's a nested dataclass and override is a dict, recurse
         if is_dataclass(inner_type) and isinstance(value, dict):
             value = build_section(inner_type, value)
