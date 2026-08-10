@@ -3,7 +3,9 @@
 import hashlib
 import json
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
+
+from backend.utils.run_context import compute_config_signature, normalize_config
 
 __all__ = ["CachingService"]
 
@@ -60,12 +62,13 @@ class CachingService:
         file_hash: Optional[str] = None,
     ) -> None:
         """Caches dataset/intermediate results keyed off dataset/config/file state."""
+        config_payload, signature = self._prepare_config_payload(config)
         self._data_cache[key] = CachePayload(
             value=value,
-            config_signature=self._hash_config(config),
+            config_signature=signature,
             dataset_id=dataset_id,
             file_hash=file_hash,
-            config_payload=config,
+            config_payload=config_payload,
             cached_at=self._current_timestamp(),
         )
 
@@ -91,12 +94,13 @@ class CachingService:
         file_hash: Optional[str] = None,
     ) -> None:
         """Caches model/resource outputs such as trained learners or forecasts."""
+        config_payload, signature = self._prepare_config_payload(config)
         self._resource_cache[key] = CachePayload(
             value=value,
-            config_signature=self._hash_config(config),
+            config_signature=signature,
             dataset_id=dataset_id,
             file_hash=file_hash,
-            config_payload=config,
+            config_payload=config_payload,
             cached_at=self._current_timestamp(),
         )
 
@@ -112,13 +116,16 @@ class CachingService:
         component: str,
         config: Dict[str, Any],
         extra_signature: Optional[str] = None,
+        file_hash: Optional[str] = None,
     ) -> str:
         """Builds a deterministic cache key driven by dataset and configuration context."""
+        _, config_signature = self._prepare_config_payload(config)
         digest_source = {
             "namespace": namespace,
             "dataset_id": dataset_id,
             "component": component,
-            "config": config,
+            "config_signature": config_signature,
+            "file_hash": file_hash,
             "extra": extra_signature,
         }
         return hashlib.sha256(json.dumps(digest_source, sort_keys=True, default=str).encode("utf-8")).hexdigest()
@@ -140,8 +147,13 @@ class CachingService:
             return False
         return True
 
+    def _prepare_config_payload(self, config: Dict[str, Any]) -> Tuple[Dict[str, Any], str]:
+        normalized = normalize_config(config)
+        signature = compute_config_signature(normalized)
+        return normalized, signature
+
     def _hash_config(self, config: Dict[str, Any]) -> str:
-        return hashlib.sha256(json.dumps(config, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+        return compute_config_signature(normalize_config(config))
 
     def _current_timestamp(self) -> str:
         from datetime import datetime
