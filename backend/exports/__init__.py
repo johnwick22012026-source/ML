@@ -10,6 +10,7 @@ __all__ = [
     "ExportService",
     "ArtifactDescriptor",
     "EvaluationArtifactBundle",
+    "DiagnosticArtifactBundle",
 ]
 
 
@@ -33,6 +34,17 @@ class EvaluationArtifactBundle:
     configuration: ArtifactDescriptor
     pipeline_metadata: ArtifactDescriptor
     task_specific_outputs: List[ArtifactDescriptor]
+
+
+@dataclass
+class DiagnosticArtifactBundle:
+    run_id: str
+    dataset_id: str
+    config_signature: str
+    metrics_summary: ArtifactDescriptor
+    diagnostics_overview: ArtifactDescriptor
+    visualization_data: List[ArtifactDescriptor]
+    supporting_artifacts: List[ArtifactDescriptor]
 
 
 class ExportService:
@@ -150,6 +162,78 @@ class ExportService:
             configuration=configuration_descriptor,
             pipeline_metadata=pipeline_descriptor,
             task_specific_outputs=task_specific_descriptors,
+        )
+
+    def package_diagnostic_artifacts(
+        self,
+        run_id: str,
+        dataset_id: str,
+        config_signature: str,
+        metrics_summary: Dict[str, Any],
+        diagnostics: Dict[str, Any],
+        visualization_payloads: Optional[Dict[str, Any]] = None,
+        supporting_payloads: Optional[Dict[str, Any]] = None,
+    ) -> DiagnosticArtifactBundle:
+        """Registers diagnostics and visualization payloads for download within the session."""
+        base_metadata = {
+            "run_id": run_id,
+            "dataset_id": dataset_id,
+            "config_signature": config_signature,
+            "category": "diagnostics",
+        }
+
+        metrics_descriptor = self.create(
+            payload=self._dump_json({"metrics": metrics_summary, "run_id": run_id}),
+            artifact_type="diagnostic-metrics",
+            file_name=f"diagnostic_metrics_{run_id}.json",
+            metadata={**base_metadata, "type": "metrics"},
+        )
+
+        diagnostics_descriptor = self.create(
+            payload=self._dump_json({"diagnostics": diagnostics, "run_id": run_id}),
+            artifact_type="diagnostic-overview",
+            file_name=f"diagnostic_overview_{run_id}.json",
+            metadata={**base_metadata, "type": "diagnostics"},
+        )
+
+        visualization_payloads = visualization_payloads or {}
+        visualization_descriptors: List[ArtifactDescriptor] = []
+        for label, payload in sorted(visualization_payloads.items()):
+            descriptor = self.create(
+                payload=self._dump_json({"label": label, "payload": payload, "run_id": run_id}),
+                artifact_type="diagnostic-visualization",
+                file_name=f"visualization_{label}_{run_id}.json",
+                metadata={
+                    **base_metadata,
+                    "type": "visualization",
+                    "label": label,
+                },
+            )
+            visualization_descriptors.append(descriptor)
+
+        supporting_payloads = supporting_payloads or {}
+        supporting_descriptors: List[ArtifactDescriptor] = []
+        for label, payload in sorted(supporting_payloads.items()):
+            descriptor = self.create(
+                payload=self._dump_json({"label": label, "payload": payload, "run_id": run_id}),
+                artifact_type="diagnostic-support",
+                file_name=f"supporting_{label}_{run_id}.json",
+                metadata={
+                    **base_metadata,
+                    "type": "supporting",
+                    "label": label,
+                },
+            )
+            supporting_descriptors.append(descriptor)
+
+        return DiagnosticArtifactBundle(
+            run_id=run_id,
+            dataset_id=dataset_id,
+            config_signature=config_signature,
+            metrics_summary=metrics_descriptor,
+            diagnostics_overview=diagnostics_descriptor,
+            visualization_data=visualization_descriptors,
+            supporting_artifacts=supporting_descriptors,
         )
 
     @staticmethod
