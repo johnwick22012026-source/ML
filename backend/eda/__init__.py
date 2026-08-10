@@ -4,10 +4,95 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+import json
+
 import numpy as np
 import pandas as pd
+import streamlit as st
+
+from backend.utils.run_context import compute_config_signature
 
 __all__ = ["EDAService"]
+
+
+def _normalize_config(config: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    def _normalize_value(value: Any) -> Any:
+        if isinstance(value, dict):
+            return {key: _normalize_value(value[key]) for key in sorted(value)}
+        if isinstance(value, (list, tuple)):
+            return [_normalize_value(item) for item in value]
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            return value
+        return str(value)
+
+    return _normalize_value(config or {})  # type: ignore[arg-type]
+
+
+def _hash_dataframe(df: pd.DataFrame) -> str:
+    try:
+        hashed = pd.util.hash_pandas_object(df, index=True).values
+        return hashlib_sha256(hashed.tobytes())
+    except Exception:  # pragma: no cover - fallback when pandas hashing fails
+        return hashlib_sha256(df.to_csv(index=False).encode("utf-8"))
+
+
+def hashlib_sha256(value: bytes) -> str:
+    import hashlib
+
+    return hashlib.sha256(value).hexdigest()
+
+
+def _perform_analysis(df: pd.DataFrame, config: Dict[str, Any]) -> Dict[str, Any]:
+    numeric_columns = df.select_dtypes(include="number").columns.tolist()
+    hist_columns = _resolve_columns(config.get("histogram", {}).get("columns"), numeric_columns)
+    kde_columns = _resolve_columns(config.get("kde", {}).get("columns"), numeric_columns)
+    box_columns = _resolve_columns(config.get("boxplot", {}).get("columns"), numeric_columns)
+    scatter_pairs = _resolve_pairs(config.get("scatter", {}).get("pairs"), numeric_columns)
+    pair_plot_columns = _resolve_columns(config.get("pair_plot", {}).get("columns"), numeric_columns)
+    correlation_method = _resolve_correlation_method(
+        config.get("correlation", {}).get("method")
+    )
+    correlation_columns = _resolve_columns(config.get("correlation", {}).get("columns"), numeric_columns)
+
+    numeric_summary = _build_numeric_summary(df)
+    missing_summary = _build_missing_value_summary(df)
+    histograms = _build_histograms(df, hist_columns)
+    kdes = _build_kdes(df, kde_columns)
+    boxplots = _build_boxplots(df, box_columns)
+    scatterplots = _build_scatterplots(df, scatter_pairs)
+    correlation_matrix = _build_correlation(df, correlation_columns, correlation_method)
+    pair_plot_data = _build_pair_plot_data(df, pair_plot_columns)
+    outlier_summary = _build_outlier_summary(df, box_columns)
+
+    return {
+        "numerical_summary": numeric_summary,
+        "missing_value_summary": missing_summary,
+        "histograms": histograms,
+        "kde": kdes,
+        "boxplots": boxplots,
+        "scatterplots": scatterplots,
+        "correlation_matrix": correlation_matrix,
+        "pair_plot_data": pair_plot_data,
+        "outlier_summary": outlier_summary,
+        "config": config,
+    }
+
+
+@st.cache_data(show_spinner=False)
+def _cached_eda_analysis(
+    dataframe: pd.DataFrame,
+    normalized_config: Dict[str, Any],
+    config_signature: str,
+    config_json: str,
+    data_signature: str,
+) -> Dict[str, Any]:
+    artifact = _perform_analysis(dataframe, normalized_config)
+    artifact["cache_context"] = {
+        "config_signature": config_signature,
+        "config_json": config_json,
+        "data_signature": data_signature,
+    }
+    return artifact
 
 
 class EDAService:
@@ -18,40 +103,20 @@ class EDAService:
     def analyze(self, data: Any, config: Dict[str, Any]) -> Dict[str, Any]:
         """Returns structured exploratory analysis artifacts driven by configuration."""
         df = self._ensure_dataframe(data)
-        numeric_columns = df.select_dtypes(include="number").columns.tolist()
-        hist_columns = self._resolve_columns(config.get("histogram", {}).get("columns"), numeric_columns)
-        kde_columns = self._resolve_columns(config.get("kde", {}).get("columns"), numeric_columns)
-        box_columns = self._resolve_columns(config.get("boxplot", {}).get("columns"), numeric_columns)
-        scatter_pairs = self._resolve_pairs(config.get("scatter", {}).get("pairs"), numeric_columns)
-        pair_plot_columns = self._resolve_columns(config.get("pair_plot", {}).get("columns"), numeric_columns)
-        correlation_method = self._resolve_correlation_method(
-            config.get("correlation", {}).get("method")
+        normalized_config = _normalize_config(config)
+        config_json = json.dumps(normalized_config, sort_keys=True)
+        config_signature = compute_config_signature(normalized_config)
+        data_signature = _hash_dataframe(df)
+
+        return _cached_eda_analysis(
+            dataframe=df,
+            normalized_config=normalized_config,
+            config_signature=config_signature,
+            config_json=config_json,
+            data_signature=data_signature,
         )
-        correlation_columns = self._resolve_columns(config.get("correlation", {}).get("columns"), numeric_columns)
 
-        numeric_summary = self._build_numeric_summary(df)
-        missing_summary = self._build_missing_value_summary(df)
-        histograms = self._build_histograms(df, hist_columns)
-        kdes = self._build_kdes(df, kde_columns)
-        boxplots = self._build_boxplots(df, box_columns)
-        scatterplots = self._build_scatterplots(df, scatter_pairs)
-        correlation_matrix = self._build_correlation(df, correlation_columns, correlation_method)
-        pair_plot_data = self._build_pair_plot_data(df, pair_plot_columns)
-        outlier_summary = self._build_outlier_summary(df, box_columns)
-
-        return {
-            "numerical_summary": numeric_summary,
-            "missing_value_summary": missing_summary,
-            "histograms": histograms,
-            "kde": kdes,
-            "boxplots": boxplots,
-            "scatterplots": scatterplots,
-            "correlation_matrix": correlation_matrix,
-            "pair_plot_data": pair_plot_data,
-            "outlier_summary": outlier_summary,
-            "config": config,
-        }
-
+    # existing helper methods remain unchanged below
     def _ensure_dataframe(self, data: Any) -> pd.DataFrame:
         if isinstance(data, pd.DataFrame):
             return data.copy()
