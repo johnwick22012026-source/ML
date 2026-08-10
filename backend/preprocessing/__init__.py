@@ -28,6 +28,8 @@ from sklearn.preprocessing import (
     StandardScaler,
 )
 
+from backend.services.ingestion import get_dataset_state
+
 __all__ = ["PreprocessingService"]
 
 
@@ -193,7 +195,13 @@ def _apply_outlier_limits(
     elif method == "winsorization":
         lower = params.get("lower", 0.01)
         upper = params.get("upper", 0.99)
-        df = df.clip(lower=df.quantile(lower), upper=df.quantile(upper), axis=1)
+        numeric_cols = df.select_dtypes(include=[np.number]).columns
+        if not numeric_cols.empty:
+            lower_vals = df[numeric_cols].quantile(lower)
+            upper_vals = df[numeric_cols].quantile(upper)
+            df.loc[:, numeric_cols] = df[numeric_cols].clip(
+                lower=lower_vals, upper=upper_vals, axis=1
+            )
     return df, removed
 
 
@@ -313,6 +321,16 @@ def _record_pipeline_state(
     }
     metadata.setdefault("pipeline", []).append(state)
     intermediates.append({"step": stage, "data": df.copy(), "details": details or {}})
+
+
+def _hash_dataset_bytes(dataset_id: Optional[str]) -> Optional[str]:
+    if not dataset_id:
+        return None
+    try:
+        state = get_dataset_state(dataset_id)
+    except KeyError:
+        return None
+    return hashlib.sha256(state.file_bytes).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -444,19 +462,41 @@ def _apply_preprocessing_pipeline(df: pd.DataFrame, config: Dict[str, Any]) -> D
     return {"data": df, "metadata": metadata, "intermediates": intermediates}
 
 
+def _build_pipeline_cache_context(
+    data_signature: str,
+    dataset_id: str,
+    dataset_file_hash: Optional[str],
+    config_json: str,
+) -> str:
+    context = {
+        "data_signature": data_signature,
+        "dataset_id": dataset_id,
+        "dataset_file_hash": dataset_file_hash,
+        "config_json": config_json,
+    }
+    return hashlib.sha256(json.dumps(context, sort_keys=True, default=str).encode()).hexdigest()
+
+
 @st.cache_data(show_spinner=False)
 def _cached_preprocessing(
     dataframe: pd.DataFrame,
     data_signature: str,
     dataset_id: str,
+    dataset_file_hash: Optional[str],
     config_json: str,
+    context_signature: str,
 ) -> Dict[str, Any]:
     df = dataframe.copy()
     blueprint = _build_preprocessing_blueprint(config_json)
     result = _apply_preprocessing_pipeline(df, blueprint.normalized_config)
-    result["metadata"]["config_signature"] = blueprint.signature
-    result["metadata"]["dataset_id"] = dataset_id
-    result["metadata"]["data_signature"] = data_signature
+    feature_signature = _hash_dataframe(result["data"])
+    metadata = result["metadata"]
+    metadata["config_signature"] = blueprint.signature
+    metadata["dataset_id"] = dataset_id
+    metadata["data_signature"] = data_signature
+    metadata["feature_matrix_signature"] = feature_signature
+    metadata["dataset_file_hash"] = dataset_file_hash
+    metadata["cache_context"] = context_signature
     return result
 
 
@@ -473,10 +513,19 @@ class PreprocessingService:
         normalized_config = _normalize_config(config)
         config_json = json.dumps(normalized_config, sort_keys=True)
         data_signature = _hash_dataframe(df)
+        dataset_file_hash = _hash_dataset_bytes(dataset_id)
+        context_signature = _build_pipeline_cache_context(
+            data_signature=data_signature,
+            dataset_id=dataset_id,
+            dataset_file_hash=dataset_file_hash,
+            config_json=config_json,
+        )
 
         return _cached_preprocessing(
             dataframe=df,
             data_signature=data_signature,
             dataset_id=dataset_id,
+            dataset_file_hash=dataset_file_hash,
             config_json=config_json,
+            context_signature=context_signature,
         )
