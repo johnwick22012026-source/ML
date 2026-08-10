@@ -1,19 +1,44 @@
-"""Helper utilities to build dataset validation summaries for Streamlit."""
+"""Helper utilities to build dataset validation summaries for Streamlit.
+
+The DatasetValidationResult exposes a stable contract that always includes the
+preview, schema, dtype summary, memory usage, missing value payload, duplicate
+row metrics, and a breakdown of the quality score inputs. Its metadata section
+also carries the payload version plus cache keys so downstream services can
+react to cache invalidation signals independently of the UI.
+"""
 from __future__ import annotations
 
 import hashlib
 import io
-import json
 import os
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 import pandas as pd
+import streamlit as st
 
 from backend.services.dataset_inspection import QualityScoreInputs
+from backend.utils.run_context import (
+    build_run_id,
+    compute_config_signature,
+    compute_file_signature,
+)
 
 VALIDATION_PAYLOAD_VERSION = "1.0"
+
+
+def _hash_bytes(payload: bytes) -> str:
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _build_cache_key(
+    file_signature: Optional[str],
+    config_signature: str,
+    file_name: str,
+) -> str:
+    normalized_file_name = file_name.lower()
+    return build_run_id(file_signature, config_signature, normalized_file_name)
 
 
 @dataclass
@@ -21,11 +46,17 @@ class DatasetValidationMetadata:
     payload_version: str
     file_hash: str
     config_signature: str
+    cache_key: str
     generated_at: str
 
 
 @dataclass
 class DatasetValidationResult:
+    """A stable validation payload that Streamlit can render directly.
+
+    All downstream steps can rely on these members remaining available.
+    """
+
     preview: Dict[str, Any]
     schema: List[Dict[str, Any]]
     dimensions: Dict[str, int]
@@ -49,58 +80,28 @@ class DatasetValidationService:
         file_bytes: bytes,
         config: Optional[Dict[str, Any]] = None,
     ) -> DatasetValidationResult:
-        """Inspect the dataset and compute metrics defined by the validation config."""
+        """Inspect the dataset and compute metrics defined by the validation config.
+
+        The Streamlit-controlled cache key is derived from the incoming file and
+        validation-specific configuration, so cached validation payloads are
+        reused until either input changes.
+        """
         if not file_bytes:
             raise ValueError("An uploaded file is required for validation.")
 
         normalized_config = config or {}
         validation_config = self._extract_validation_config(normalized_config)
-        df = self._load_dataframe(
+        config_signature = compute_config_signature(validation_config)
+        file_signature = compute_file_signature(file_bytes)
+        if file_signature is None:
+            raise ValueError("Unable to create a file signature for the uploaded payload.")
+
+        return _validate_cached(
             file_name=file_name,
             file_bytes=file_bytes,
             validation_config=validation_config,
-        )
-
-        row_count = len(df)
-        column_count = df.shape[1]
-        bound_preview_rows = self._resolve_preview_rows(validation_config, row_count)
-        preview_mode = validation_config.get("preview_mode", "head")
-        preview = self._build_preview(
-            df=df,
-            rows=bound_preview_rows,
-            mode=preview_mode,
-            seed=self._resolve_seed(validation_config),
-        )
-        schema = self._build_schema(df)
-        dtype_summary = self._build_dtype_summary(df)
-        memory_usage = int(df.memory_usage(deep=True).sum())
-        missing_counts = {col: int(cnt) for col, cnt in df.isna().sum().items()}
-        total_missing = sum(missing_counts.values())
-        duplicate_rows = int(df.duplicated().sum())
-        quality_score, quality_inputs = _compute_quality_score(
-            rows=row_count,
-            columns=column_count,
-            missing_values=total_missing,
-            duplicate_rows=duplicate_rows,
-        )
-        metadata = DatasetValidationMetadata(
-            payload_version=VALIDATION_PAYLOAD_VERSION,
-            file_hash=_hash_bytes(file_bytes),
-            config_signature=_hash_config(normalized_config),
-            generated_at=datetime.utcnow().isoformat() + "Z",
-        )
-        return DatasetValidationResult(
-            preview=preview,
-            schema=schema,
-            dimensions={"rows": row_count, "columns": column_count},
-            dtype_summary=dtype_summary,
-            memory_usage_bytes=memory_usage,
-            missing_value_counts=missing_counts,
-            total_missing_values=total_missing,
-            duplicate_row_count=duplicate_rows,
-            quality_score=quality_score,
-            quality_score_inputs=quality_inputs,
-            metadata=metadata,
+            config_signature=config_signature,
+            file_signature=file_signature,
         )
 
     @staticmethod
@@ -179,7 +180,7 @@ class DatasetValidationService:
         try:
             if lower_name.endswith(".csv"):
                 return pd.read_csv(buffer, **csv_options)
-            if lower_name.endswith(('.xlsx', '.xlsm', '.xls')):
+            if lower_name.endswith((".xlsx", ".xlsm", ".xls")):
                 excel_kwargs = {**excel_options}
                 extension = os.path.splitext(lower_name)[1]
                 if extension == ".xls":
@@ -192,16 +193,7 @@ class DatasetValidationService:
         raise ValueError("Unsupported file type for validation. Only CSV and Excel are supported.")
 
 
-def _hash_bytes(payload: bytes) -> str:
-    return hashlib.sha256(payload).hexdigest()
-
-
-def _hash_config(config: Dict[str, Any]) -> str:
-    config_serialized = json.dumps(config, sort_keys=True, default=str)
-    return hashlib.sha256(config_serialized.encode("utf-8")).hexdigest()
-
-
-def _compute_quality_score(
+def _validate_quality_score(
     rows: int,
     columns: int,
     missing_values: int,
@@ -230,3 +222,81 @@ def _compute_quality_score(
         duplicate_rows=duplicate_rows,
     )
     return bounded_score, inputs
+
+
+def _build_validation_metadata(
+    file_signature: str,
+    config_signature: str,
+    file_name: str,
+) -> DatasetValidationMetadata:
+    cache_key = _build_cache_key(file_signature, config_signature, file_name)
+    return DatasetValidationMetadata(
+        payload_version=VALIDATION_PAYLOAD_VERSION,
+        file_hash=file_signature,
+        config_signature=config_signature,
+        cache_key=cache_key,
+        generated_at=datetime.utcnow().isoformat() + "Z",
+    )
+
+
+@st.cache_data(
+    show_spinner=False,
+    hash_funcs={
+        bytes: _hash_bytes,
+    },
+)
+def _validate_cached(
+    file_name: str,
+    file_bytes: bytes,
+    validation_config: Dict[str, Any],
+    config_signature: str,
+    file_signature: str,
+) -> DatasetValidationResult:
+    """Cacheable validator keyed by the file signature and validation config signature."""
+    df = DatasetValidationService._load_dataframe(
+        file_name=file_name,
+        file_bytes=file_bytes,
+        validation_config=validation_config,
+    )
+    row_count = len(df)
+    column_count = df.shape[1]
+    bound_preview_rows = DatasetValidationService._resolve_preview_rows(
+        validation_config, row_count
+    )
+    preview_mode = validation_config.get("preview_mode", "head")
+    preview = DatasetValidationService._build_preview(
+        df=df,
+        rows=bound_preview_rows,
+        mode=preview_mode,
+        seed=DatasetValidationService._resolve_seed(validation_config),
+    )
+    schema = DatasetValidationService._build_schema(df)
+    dtype_summary = DatasetValidationService._build_dtype_summary(df)
+    memory_usage = int(df.memory_usage(deep=True).sum())
+    missing_counts = {col: int(cnt) for col, cnt in df.isna().sum().items()}
+    total_missing = sum(missing_counts.values())
+    duplicate_rows = int(df.duplicated().sum())
+    quality_score, quality_inputs = _validate_quality_score(
+        rows=row_count,
+        columns=column_count,
+        missing_values=total_missing,
+        duplicate_rows=duplicate_rows,
+    )
+    metadata = _build_validation_metadata(
+        file_signature=file_signature,
+        config_signature=config_signature,
+        file_name=file_name,
+    )
+    return DatasetValidationResult(
+        preview=preview,
+        schema=schema,
+        dimensions={"rows": row_count, "columns": column_count},
+        dtype_summary=dtype_summary,
+        memory_usage_bytes=memory_usage,
+        missing_value_counts=missing_counts,
+        total_missing_values=total_missing,
+        duplicate_row_count=duplicate_rows,
+        quality_score=quality_score,
+        quality_score_inputs=quality_inputs,
+        metadata=metadata,
+    )
