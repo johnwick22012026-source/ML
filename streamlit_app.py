@@ -19,6 +19,46 @@ st.set_page_config(page_title="Dataset Workspace", layout="wide")
 DATASET_ID = "workspace_dataset"
 DEFAULT_INGEST_CONFIG: Dict[str, Any] = {"read_params": {"low_memory": False}}
 
+ROLE_DEFINITIONS = [
+    {"role": "target", "label": "Target column", "multi": False},
+    {"role": "datetime", "label": "Datetime column", "multi": False},
+    {"role": "id", "label": "ID column", "multi": False},
+    {"role": "grouping", "label": "Grouping columns", "multi": True},
+    {"role": "ignore", "label": "Ignore columns", "multi": True},
+    {"role": "categorical", "label": "Categorical columns", "multi": True},
+    {"role": "numeric", "label": "Numeric columns", "multi": True},
+    {"role": "forecasting", "label": "Forecasting columns", "multi": True},
+]
+
+
+def _generate_sample_frame() -> pd.DataFrame:
+    dates = pd.date_range(end=pd.Timestamp.today(), periods=30, freq="D")
+    values = np.sin(np.linspace(0, np.pi * 3, len(dates))) * 10 + np.linspace(0, 5, len(dates))
+    categories = ["Baseline" if i % 3 == 0 else "Variant" if i % 3 == 1 else "Control" for i in range(len(dates))]
+    return pd.DataFrame({"measurement_date": dates, "value": values.round(2), "category": categories})
+
+
+def _generate_clustering_frame() -> pd.DataFrame:
+    centers = np.array([[1, 1], [5, 5], [9, 2]])
+    points = np.vstack([np.random.randn(30, 2) + center for center in centers])
+    ids = [f"point-{i+1}" for i in range(len(points))]
+    categories = ["A" if i < 30 else "B" if i < 60 else "C" for i in range(len(points))]
+    return pd.DataFrame(
+        {
+            "x_coord": points[:, 0].round(2),
+            "y_coord": points[:, 1].round(2),
+            "cluster": categories,
+            "record_id": ids,
+            "measured_at": pd.date_range(end=pd.Timestamp.today(), periods=len(points), freq="H"),
+        }
+    )
+
+
+SAMPLE_DATASETS = {
+    "Sine wave trajectory": _generate_sample_frame,
+    "Clustered experiment": _generate_clustering_frame,
+}
+
 
 def _serialize_dataframe_to_bytes(df: pd.DataFrame, file_name: str) -> bytes:
     if file_name.lower().endswith(".xlsx"):
@@ -29,13 +69,6 @@ def _serialize_dataframe_to_bytes(df: pd.DataFrame, file_name: str) -> bytes:
     buffer = io.BytesIO()
     df.to_csv(buffer, index=False)
     return buffer.getvalue()
-
-
-def _generate_sample_frame() -> pd.DataFrame:
-    dates = pd.date_range(end=pd.Timestamp.today(), periods=30, freq="D")
-    values = np.sin(np.linspace(0, np.pi * 3, len(dates))) * 10 + np.linspace(0, 5, len(dates))
-    categories = ["Baseline" if i % 3 == 0 else "Variant" if i % 3 == 1 else "Control" for i in range(len(dates))]
-    return pd.DataFrame({"measurement_date": dates, "value": values.round(2), "category": categories})
 
 
 def _refresh_inspection(state: Optional[DatasetState]) -> None:
@@ -51,9 +84,32 @@ def _refresh_inspection(state: Optional[DatasetState]) -> None:
         st.session_state["inspection_error"] = f"Failed to inspect dataset: {exc}"
 
 
-def _update_session_state(state: Optional[DatasetState]) -> None:
+def _clear_role_configuration() -> None:
+    for role_def in ROLE_DEFINITIONS:
+        key = f"dataset_role_{role_def['role']}"
+        if key in st.session_state:
+            del st.session_state[key]
+    st.session_state["dataset_config"] = {"column_roles": {}, "available_columns": []}
+
+
+def _update_session_state(state: Optional[DatasetState], reset_roles: bool = False) -> None:
     st.session_state["dataset_state"] = state
     _refresh_inspection(state)
+    if reset_roles or state is None:
+        _clear_role_configuration()
+
+
+def _ensure_dataset_config_columns(columns: list[str]) -> None:
+    snapshot = st.session_state.get("dataset_config", {})
+    snapshot["available_columns"] = columns
+    column_roles = snapshot.get("column_roles", {})
+    filtered_roles = {
+        role: [col for col in selections if col in columns]
+        for role, selections in column_roles.items()
+        if selections
+    }
+    snapshot["column_roles"] = filtered_roles
+    st.session_state["dataset_config"] = snapshot
 
 
 def _render_inspection(inspect_result: DatasetInspectionResult) -> None:
@@ -116,10 +172,62 @@ def _render_inspection(inspect_result: DatasetInspectionResult) -> None:
     st.table(breakdown_df)
 
 
+def _render_role_configuration(columns: list[str]) -> None:
+    if not columns:
+        st.warning("No columns available for role configuration.")
+        return
+
+    st.markdown("### Column role configuration")
+    st.caption("Define how the dataset columns should be interpreted downstream without touching backend code.")
+    role_layouts = st.columns(2)
+
+    column_roles: Dict[str, list[str]] = {}
+    for idx, role_def in enumerate(ROLE_DEFINITIONS):
+        column_slot = role_layouts[idx % 2]
+        with column_slot:
+            role = role_def["role"]
+            label = role_def["label"]
+            key = f"dataset_role_{role}"
+            if role_def["multi"]:
+                previous = st.session_state.get(key, [])
+                default = [col for col in previous if col in columns]
+                selection = st.multiselect(
+                    label,
+                    options=columns,
+                    default=default,
+                    key=key,
+                )
+                if selection:
+                    column_roles[role] = selection
+            else:
+                options = [""] + columns
+                prev_value = st.session_state.get(key, "")
+                if prev_value in options:
+                    default_index = options.index(prev_value)
+                else:
+                    default_index = 0
+                value = st.selectbox(
+                    label,
+                    options,
+                    index=default_index,
+                    key=key,
+                )
+                if value:
+                    column_roles[role] = [value]
+
+    st.session_state["dataset_config"] = {
+        "column_roles": column_roles,
+        "available_columns": columns,
+    }
+    st.markdown("#### Current configuration")
+    st.json(st.session_state["dataset_config"], expanded=False)
+
+
 if "dataset_state" not in st.session_state:
     st.session_state["dataset_state"] = None
     st.session_state["dataset_inspection"] = None
     st.session_state["inspection_error"] = ""
+    st.session_state["dataset_config"] = {"column_roles": {}, "available_columns": []}
 
 st.title("📊 Dataset Workspace")
 
@@ -154,7 +262,7 @@ with st.container():
                             file_bytes=file_bytes,
                             config=DEFAULT_INGEST_CONFIG,
                         )
-                        _update_session_state(state)
+                        _update_session_state(state, reset_roles=True)
                         st.success("Dataset uploaded successfully.")
                     except Exception as exc:
                         st.error(f"Failed to ingest dataset: {exc}")
@@ -172,7 +280,7 @@ with st.container():
                             file_bytes=uploaded_file.getvalue(),
                             config=DEFAULT_INGEST_CONFIG,
                         )
-                        _update_session_state(state)
+                        _update_session_state(state, reset_roles=True)
                         st.success("Dataset replaced successfully.")
                     except Exception as exc:
                         st.error(f"Failed to replace dataset: {exc}")
@@ -194,24 +302,39 @@ with st.container():
                         st.error(f"Reload failed: {exc}")
         with lifecycle_col2:
             if st.button("Remove dataset"):
-                remove_dataset(dataset_id=DATASET_ID)
-                _update_session_state(None)
-                st.info("Dataset removed from memory.")
+                if not st.session_state["dataset_state"]:
+                    st.warning("No dataset loaded yet.")
+                else:
+                    try:
+                        remove_dataset(dataset_id=DATASET_ID)
+                        _update_session_state(None, reset_roles=True)
+                        st.info("Dataset removed from memory.")
+                    except Exception as exc:
+                        st.error(f"Failed to remove dataset: {exc}")
+        sample_choice = st.selectbox(
+            "Select a sample dataset",
+            options=list(SAMPLE_DATASETS.keys()),
+            key="preferred_sample_dataset",
+        )
         if st.button("Load sample dataset"):
-            sample_df = _generate_sample_frame()
-            sample_bytes = _serialize_dataframe_to_bytes(sample_df, "sample_dataset.csv")
-            try:
-                state = ingest_dataset(
-                    dataset_id=DATASET_ID,
-                    name="Sample experimental dataset",
-                    file_name="sample_dataset.csv",
-                    file_bytes=sample_bytes,
-                    config=DEFAULT_INGEST_CONFIG,
-                )
-                _update_session_state(state)
-                st.success("Sample dataset loaded for quick experimentation.")
-            except Exception as exc:
-                st.error(f"Sample dataset ingestion failed: {exc}")
+            generator = SAMPLE_DATASETS.get(sample_choice)
+            if generator:
+                sample_df = generator()
+                sample_bytes = _serialize_dataframe_to_bytes(sample_df, "sample_dataset.csv")
+                try:
+                    state = ingest_dataset(
+                        dataset_id=DATASET_ID,
+                        name=f"Sample - {sample_choice}",
+                        file_name="sample_dataset.csv",
+                        file_bytes=sample_bytes,
+                        config=DEFAULT_INGEST_CONFIG,
+                    )
+                    _update_session_state(state, reset_roles=True)
+                    st.success("Sample dataset loaded for quick experimentation.")
+                except Exception as exc:
+                    st.error(f"Sample dataset ingestion failed: {exc}")
+            else:
+                st.warning("Selected sample dataset generator is unavailable.")
 
 st.markdown("---")
 
@@ -246,6 +369,15 @@ with two_column_layout[1]:
                 st.warning(f"Unable to sample dataset: {exc}")
     else:
         st.info("Sampling will become available once a dataset is inspected.")
+
+if state and inspection:
+    columns = state.dataframe.columns.tolist()
+    _ensure_dataset_config_columns(columns)
+    _render_role_configuration(columns)
+else:
+    st.markdown("---")
+    st.markdown("### Dataset role configuration")
+    st.info("Configure column roles once a dataset is available.")
 
 analysis_section = st.container()
 with analysis_section:
