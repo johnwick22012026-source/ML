@@ -30,6 +30,59 @@ ROLE_DEFINITIONS = [
     {"role": "forecasting", "label": "Forecasting columns", "multi": True},
 ]
 
+MISSING_VALUE_STRATEGIES = [
+    "drop rows",
+    "drop columns",
+    "mean",
+    "median",
+    "mode",
+    "constant",
+    "KNN Imputer",
+    "Iterative Imputer",
+    "forward fill",
+    "backward fill",
+]
+
+OUTLIER_METHODS = [
+    "none",
+    "IQR",
+    "Z-score",
+    "Isolation Forest",
+    "Local Outlier Factor",
+    "Winsorization",
+]
+
+ENCODING_STRATEGIES = [
+    "none",
+    "one-hot",
+    "ordinal",
+    "frequency",
+    "label",
+]
+
+SCALING_STRATEGIES = [
+    "none",
+    "standard",
+    "min-max",
+    "robust",
+    "quantile",
+    "power",
+]
+
+PREPROCESSING_LABEL_DEFAULTS = {
+    "missing": "Missing value strategy",
+    "outlier": "Outlier handling",
+    "encoding": "Encoding strategy",
+    "scaling": "Scaling strategy",
+}
+
+PREPROCESSING_DEFAULT_STRATEGIES = {
+    "missing": "drop rows",
+    "outlier": "none",
+    "encoding": "none",
+    "scaling": "none",
+}
+
 
 def _generate_sample_frame() -> pd.DataFrame:
     dates = pd.date_range(end=pd.Timestamp.today(), periods=30, freq="D")
@@ -222,12 +275,89 @@ def _render_role_configuration(columns: list[str]) -> None:
     st.markdown("#### Current configuration")
     st.json(st.session_state["dataset_config"], expanded=False)
 
+PREPROCESSING_SESSION_KEYS = {
+    "missing": "preprocessing_missing_strategy",
+    "outlier": "preprocessing_outlier_method",
+    "encoding": "preprocessing_encoding_strategy",
+    "scaling": "preprocessing_scaling_strategy",
+}
+
+
+def _ensure_preprocessing_session_state() -> None:
+    for section, label in PREPROCESSING_LABEL_DEFAULTS.items():
+        label_key = f"preprocessing_label_override_{section}"
+        if label_key not in st.session_state:
+            st.session_state[label_key] = label
+    for section, default_value in PREPROCESSING_DEFAULT_STRATEGIES.items():
+        default_key = f"preprocessing_default_{section}"
+        if default_key not in st.session_state:
+            st.session_state[default_key] = default_value
+        selector_key = PREPROCESSING_SESSION_KEYS[section]
+        if selector_key not in st.session_state:
+            st.session_state[selector_key] = default_value
+
+
+def _build_missing_config(selection: str) -> Dict[str, Any]:
+    mapping: Dict[str, Any] = {}
+    if selection == "drop rows":
+        mapping["strategy"] = "drop"
+        mapping["how"] = "any"
+    elif selection == "drop columns":
+        mapping["strategy"] = "drop"
+        mapping["how"] = "any"
+        mapping["axis"] = 1
+    elif selection == "mean":
+        mapping["strategy"] = "mean"
+    elif selection == "median":
+        mapping["strategy"] = "median"
+    elif selection == "mode":
+        mapping["strategy"] = "most_frequent"
+    elif selection == "constant":
+        mapping["strategy"] = "constant"
+    elif selection == "KNN Imputer":
+        mapping["strategy"] = "knn"
+    elif selection == "Iterative Imputer":
+        mapping["strategy"] = "iterative"
+    elif selection == "forward fill":
+        mapping["strategy"] = "ffill"
+    elif selection == "backward fill":
+        mapping["strategy"] = "bfill"
+    return mapping
+
+
+def _build_outlier_config(selection: str) -> Dict[str, Any]:
+    method_map = {
+        "none": "none",
+        "IQR": "iqr",
+        "Z-score": "zscore",
+        "Isolation Forest": "isolation_forest",
+        "Local Outlier Factor": "local_outlier_factor",
+        "Winsorization": "winsorization",
+    }
+    return {"method": method_map.get(selection, "none")}
+
+
+def _build_encoding_config(selection: str, columns: list[str]) -> Dict[str, Any]:
+    config: Dict[str, Any] = {"strategy": selection if selection != "none" else "none"}
+    if columns:
+        config["columns"] = columns
+    return config
+
+
+def _build_scaling_config(selection: str, columns: list[str]) -> Dict[str, Any]:
+    config: Dict[str, Any] = {"strategy": selection if selection != "none" else "none"}
+    if columns:
+        config["columns"] = columns
+    return config
+
 
 if "dataset_state" not in st.session_state:
     st.session_state["dataset_state"] = None
     st.session_state["dataset_inspection"] = None
     st.session_state["inspection_error"] = ""
     st.session_state["dataset_config"] = {"column_roles": {}, "available_columns": []}
+
+_ensure_preprocessing_session_state()
 
 st.title("📊 Dataset Workspace")
 
@@ -378,6 +508,17 @@ else:
     st.markdown("---")
     st.markdown("### Dataset role configuration")
     st.info("Configure column roles once a dataset is available.")
+
+preprocessing_section = st.container()
+with preprocessing_section:
+    st.markdown("---")
+    st.markdown("### Preprocessing configuration panel")
+    st.caption("Drive missing value, outlier, encoding, and scaling choices directly from the browser without touching backend code.")
+
+    with st.expander("Customize panel labels & defaults", expanded=False):
+        st.write("Use these controls to rename sections or change the defaults that feed into the preprocessing panel on every rerun.")
+        label_cols = st.columns(2)
+        for idx, key in enumerate(PREPROCESSI... (truncated for brevity)
 
 analysis_section = st.container()
 with analysis_section:
