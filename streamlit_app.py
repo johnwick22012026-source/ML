@@ -10,6 +10,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
+from backend.evaluation import EvaluationService
 from backend.eda import EDAService
 from backend.ml import ModelRegistry
 from backend.services.dataset_inspection import DatasetInspectionResult, inspect_dataset
@@ -208,6 +209,9 @@ MODEL_HYPERPARAMETER_TEMPLATES: Dict[str, List[Dict[str, Any]]] = {
         {"name": "gamma", "type": "select", "default": "scale", "options": ["scale", "auto"]},
     ],
 }
+
+WORKFLOW_METRIC_OPTIONS = ["rmse", "mae", "mse", "r2", "accuracy"]
+WORKFLOW_EVALUATION_SCOPES = ["validation", "holdout", "production"]
 
 
 def _format_ml_task_label(value: str) -> str:
@@ -638,5 +642,200 @@ def _render_model_selection_panel() -> None:
                 _render_model_hyperparameter_inputs(model_name)
 
 
+def _ensure_workflow_session_state() -> None:
+    if "workflow_selected_metrics" not in st.session_state:
+        st.session_state["workflow_selected_metrics"] = WORKFLOW_METRIC_OPTIONS[:3]
+    if "workflow_evaluation_scope" not in st.session_state:
+        st.session_state["workflow_evaluation_scope"] = WORKFLOW_EVALUATION_SCOPES[0]
+    if "workflow_comparison" not in st.session_state:
+        st.session_state["workflow_comparison"] = None
+    if "workflow_evaluation_artifact" not in st.session_state:
+        st.session_state["workflow_evaluation_artifact"] = None
+    if "workflow_last_run" not in st.session_state:
+        st.session_state["workflow_last_run"] = ""
+    if "workflow_last_evaluation" not in st.session_state:
+        st.session_state["workflow_last_evaluation"] = ""
+
+
+def _simulate_workflow_response(
+    selected_models: List[str],
+    metrics: List[str],
+    evaluation_scope: str,
+) -> Dict[str, Any]:
+    rng = np.random.default_rng(int(datetime.utcnow().timestamp()))
+    models: List[Dict[str, Any]] = []
+    for model_name in selected_models:
+        metric_map: Dict[str, float] = {}
+        for metric in metrics:
+            if metric in {"rmse", "mae", "mse"}:
+                metric_map[metric] = round(max(0.01, rng.normal(0.7, 0.3)), 3)
+            elif metric == "accuracy":
+                metric_map[metric] = round(min(1.0, max(0.0, rng.normal(0.65, 0.15))), 3)
+            else:
+                metric_map[metric] = round(min(1.0, max(0.0, rng.normal(0.5, 0.2))), 3)
+        diagnostics = {
+            "training_time_sec": round(rng.uniform(12, 90), 1),
+            "convergence_pct": round(rng.uniform(82, 99), 1),
+            "validation_loss": round(metric_map.get("rmse", metric_map.get("mse", 0.0)), 3),
+        }
+        models.append(
+            {
+                "model_name": model_name,
+                "metrics": metric_map,
+                "diagnostics": diagnostics,
+            }
+        )
+    primary_metric = metrics[0] if metrics else "accuracy"
+    goal = "min" if primary_metric in {"rmse", "mae", "mse"} else "max"
+    best_model = sorted(
+        models,
+        key=lambda entry: entry["metrics"].get(primary_metric, 0.0),
+        reverse=goal == "max",
+    )[0]
+    payload = {
+        "generated_at": datetime.utcnow().isoformat(),
+        "selected_models": selected_models,
+        "metrics": metrics,
+        "evaluation_scope": evaluation_scope,
+        "models": models,
+        "best_model": best_model,
+    }
+    payload["artifacts"] = {
+        "comparison_payload": json.dumps(payload, indent=2),
+    }
+    return payload
+
+
+def _simulate_evaluation_artifact(
+    evaluation_scope: str,
+    model_payloads: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    service = EvaluationService()
+    predictions: List[int] = []
+    targets: List[int] = []
+    for entry in model_payloads:
+        accuracy = entry["metrics"].get("accuracy", 0.5)
+        sample_size = 60
+        matches = min(sample_size, max(0, int(round(accuracy * sample_size))))
+        predictions.extend([1] * matches + [0] * (sample_size - matches))
+        targets.extend([1] * sample_size)
+    evaluation = service.evaluate(predictions, targets, {"scope": evaluation_scope})
+    artifact = {
+        "scope": evaluation_scope,
+        "generated_at": datetime.utcnow().isoformat(),
+        "evaluation": evaluation,
+        "artifacts": {
+            "evaluation_report": json.dumps(evaluation, indent=2),
+        },
+    }
+    return artifact
+
+
+def _render_workflow_results_panel() -> None:
+    comparison = st.session_state.get("workflow_comparison")
+    evaluation = st.session_state.get("workflow_evaluation_artifact")
+    if not comparison and not evaluation:
+        return
+    st.header("Optimization & evaluation outputs")
+    if comparison:
+        with st.expander("Model comparison summary", expanded=True):
+            st.subheader("Metrics overview")
+            metric_records: List[Dict[str, Any]] = []
+            for entry in comparison["models"]:
+                row = {"Model": entry["model_name"]}
+                for metric_name, value in entry["metrics"].items():
+                    row[metric_name.upper()] = value
+                metric_records.append(row)
+            if metric_records:
+                st.dataframe(pd.DataFrame(metric_records))
+            st.caption(f"Primary metric: {comparison['metrics'][0] if comparison['metrics'] else 'accuracy'}")
+            st.metric(
+                "Best performing model",
+                comparison["best_model"]["model_name"],
+                delta=None,
+            )
+            if comparison["best_model"].get("metrics"):
+                best_metrics = comparison["best_model"]["metrics"]
+                st.json(best_metrics)
+            st.download_button(
+                "Download comparison payload",
+                data=comparison["artifacts"]["comparison_payload"].encode("utf-8"),
+                file_name="model_comparison_payload.json",
+                mime="application/json",
+            )
+            for entry in comparison["models"]:
+                with st.expander(f"Diagnostics: {entry['model_name']}", expanded=False):
+                    st.table(pd.DataFrame([entry["diagnostics"]]))
+    if evaluation:
+        with st.expander("Evaluation diagnostics", expanded=True):
+            st.subheader(f"Scope: {evaluation['scope'].title()}")
+            st.json(evaluation["evaluation"])
+            st.download_button(
+                "Download evaluation artifact",
+                data=evaluation["artifacts"]["evaluation_report"].encode("utf-8"),
+                file_name="evaluation_artifact.json",
+                mime="application/json",
+            )
+
+
+def _handle_workflow_actions() -> None:
+    current_task = st.session_state.get("active_task_type", SUPPORTED_MODEL_TASKS[0])
+    selection_key = f"selected_models_{current_task}"
+    selected_models = st.session_state.get(selection_key, [])
+    if not selected_models:
+        st.warning("Optimization requires at least one selected algorithm.")
+        return
+    metrics = st.session_state.get("workflow_selected_metrics", WORKFLOW_METRIC_OPTIONS[:3])
+    if not metrics:
+        st.warning("Pick one or more metrics to surface in the comparison summary.")
+        return
+    scope = st.session_state.get("workflow_evaluation_scope", WORKFLOW_EVALUATION_SCOPES[0])
+    comparison_payload = _simulate_workflow_response(selected_models, metrics, scope)
+    st.session_state["workflow_comparison"] = comparison_payload
+    st.session_state["workflow_evaluation_artifact"] = _simulate_evaluation_artifact(
+        scope, comparison_payload["models"]
+    )
+    st.session_state["workflow_last_run"] = datetime.utcnow().isoformat()
+    st.success("Optimization and comparison completed. Inspect the panel below for details.")
+
+
+def _refresh_evaluation_outputs() -> None:
+    comparison = st.session_state.get("workflow_comparison")
+    if not comparison:
+        st.warning("Run optimization before generating evaluation artifacts.")
+        return
+    scope = st.session_state.get("workflow_evaluation_scope", WORKFLOW_EVALUATION_SCOPES[0])
+    st.session_state["workflow_evaluation_artifact"] = _simulate_evaluation_artifact(scope, comparison["models"])
+    st.session_state["workflow_last_evaluation"] = datetime.utcnow().isoformat()
+    st.success("Evaluation diagnostics refreshed.")
+
+
 # Additional UI initialization for model configuration
+_ensure_preprocessing_session_state()
+_ensure_feature_engineering_session_state()
 _render_model_selection_panel()
+_ensure_workflow_session_state()
+
+with st.sidebar.expander("Optimization & evaluation workflow", expanded=True):
+    st.caption("Select metrics and artifacts to carry into the optimization pipeline.")
+    st.multiselect(
+        "Comparison metrics",
+        options=WORKFLOW_METRIC_OPTIONS,
+        default=st.session_state["workflow_selected_metrics"],
+        key="workflow_selected_metrics",
+        help="These metrics appear in the summary table post-comparison.",
+    )
+    st.radio(
+        "Evaluation scope",
+        options=WORKFLOW_EVALUATION_SCOPES,
+        index=WORKFLOW_EVALUATION_SCOPES.index(
+            st.session_state["workflow_evaluation_scope"]
+        ),
+        key="workflow_evaluation_scope",
+    )
+    if st.button("Optimize & compare models", key="optimize_models"):
+        _handle_workflow_actions()
+    if st.button("Refresh evaluation diagnostics", key="refresh_evaluation"):
+        _refresh_evaluation_outputs()
+
+_render_workflow_results_panel()
