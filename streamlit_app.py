@@ -1,4 +1,7 @@
+import hashlib
 import io
+import json
+from datetime import datetime
 from typing import Any, Dict, Optional
 
 import numpy as np
@@ -83,6 +86,20 @@ PREPROCESSING_DEFAULT_STRATEGIES = {
     "scaling": "none",
 }
 
+PREPROCESSING_SESSION_KEYS = {
+    "missing": "preprocessing_missing_strategy",
+    "outlier": "preprocessing_outlier_method",
+    "encoding": "preprocessing_encoding_strategy",
+    "scaling": "preprocessing_scaling_strategy",
+}
+
+CACHE_STATUS_COPY: Dict[str, str] = {
+    "not_run": "Preprocessing has not been run yet.",
+    "dataset_changed": "Dataset change invalidates cached preprocessing results.",
+    "reused": "Cache hit: preprocessing results reused without recomputation.",
+    "recomputed": "Cache miss: preprocessing recomputed due to configuration changes.",
+}
+
 
 def _generate_sample_frame() -> pd.DataFrame:
     dates = pd.date_range(end=pd.Timestamp.today(), periods=30, freq="D")
@@ -124,6 +141,164 @@ def _serialize_dataframe_to_bytes(df: pd.DataFrame, file_name: str) -> bytes:
     return buffer.getvalue()
 
 
+def _compute_file_hash(file_bytes: Optional[bytes]) -> Optional[str]:
+    if not file_bytes:
+        return None
+    return hashlib.sha256(file_bytes).hexdigest()
+
+
+def _derive_dataset_hash_from_state(state: Optional[DatasetState]) -> Optional[str]:
+    if not state:
+        return None
+    for attr in ("file_hash", "file_signature", "signature", "dataset_hash"):
+        candidate = getattr(state, attr, None)
+        if candidate:
+            return str(candidate)
+    file_bytes = getattr(state, "file_bytes", None)
+    if isinstance(file_bytes, (bytes, bytearray)):
+        return _compute_file_hash(bytes(file_bytes))
+    return None
+
+
+def _extract_dataframe_columns(state: Optional[DatasetState]) -> list[str]:
+    if not state:
+        return []
+    df = getattr(state, "dataframe", None)
+    if isinstance(df, pd.DataFrame):
+        return df.columns.tolist()
+    if hasattr(df, "columns"):
+        try:
+            return list(df.columns)
+        except Exception:
+            return []
+    return st.session_state.get("dataset_config", {}).get("available_columns", [])
+
+
+def _build_preprocessing_payload(columns: list[str]) -> Dict[str, Any]:
+    column_config = st.session_state.get("dataset_config", {}).get("column_roles", {})
+    numeric_columns = column_config.get("numeric", [])
+    categorical_columns = column_config.get("categorical", [])
+
+    missing_selection = st.session_state.get(
+        PREPROCESSING_SESSION_KEYS["missing"], PREPROCESSING_DEFAULT_STRATEGIES["missing"]
+    )
+    missing_cfg = _build_missing_config(missing_selection)
+    if columns:
+        missing_cfg["columns"] = columns
+
+    outlier_selection = st.session_state.get(
+        PREPROCESSING_SESSION_KEYS["outlier"], PREPROCESSING_DEFAULT_STRATEGIES["outlier"]
+    )
+    outlier_cfg = _build_outlier_config(outlier_selection)
+    if numeric_columns:
+        outlier_cfg["columns"] = numeric_columns
+
+    encoding_selection = st.session_state.get(
+        PREPROCESSING_SESSION_KEYS["encoding"], PREPROCESSING_DEFAULT_STRATEGIES["encoding"]
+    )
+    encoding_cfg = _build_encoding_config(encoding_selection, categorical_columns)
+
+    scaling_selection = st.session_state.get(
+        PREPROCESSING_SESSION_KEYS["scaling"], PREPROCESSING_DEFAULT_STRATEGIES["scaling"]
+    )
+    scaling_cfg = _build_scaling_config(scaling_selection, numeric_columns)
+
+    label_overrides = {
+        section: st.session_state.get(
+            f"preprocessing_label_override_{section}", PREPROCESSING_LABEL_DEFAULTS[section]
+        )
+        for section in PREPROCESSING_LABEL_DEFAULTS
+    }
+    default_strategies = {
+        section: st.session_state.get(
+            f"preprocessing_default_{section}", PREPROCESSING_DEFAULT_STRATEGIES[section]
+        )
+        for section in PREPROCESSING_DEFAULT_STRATEGIES
+    }
+    strategy_overrides = {
+        section: st.session_state.get(PREPROCESSING_SESSION_KEYS[section], default_strategies[section])
+        for section in PREPROCESSING_DEFAULT_STRATEGIES
+    }
+
+    payload: Dict[str, Any] = {
+        "data_settings": {
+            "dataset_id": DATASET_ID,
+            "dataset_display_name": st.session_state.get("dataset_display_name", ""),
+            "dataset_file_hash": st.session_state.get("dataset_file_hash"),
+        },
+        "column_selection": column_config,
+        "labels": label_overrides,
+        "default_strategies": default_strategies,
+        "active_strategies": strategy_overrides,
+        "missing_value": missing_cfg,
+        "outlier": outlier_cfg,
+        "encoding": encoding_cfg,
+        "scaling": scaling_cfg,
+    }
+    return payload
+
+
+def _normalize_payload(payload: Any) -> Any:
+    if isinstance(payload, dict):
+        return {key: _normalize_payload(payload[key]) for key in sorted(payload)}
+    if isinstance(payload, list):
+        return [_normalize_payload(val) for val in payload]
+    if isinstance(payload, tuple):
+        return tuple(_normalize_payload(val) for val in payload)
+    if isinstance(payload, (str, int, float, bool)) or payload is None:
+        return payload
+    return str(payload)
+
+
+def _prepare_cache_payload(columns: list[str]) -> Dict[str, Any]:
+    payload = _build_preprocessing_payload(columns)
+    normalized = json.dumps(_normalize_payload(payload), sort_keys=True)
+    signature = hashlib.sha256(normalized.encode()).hexdigest()
+    dataset_hash = st.session_state.get("dataset_file_hash")
+    previous_signature = st.session_state.get("preprocessing_last_signature")
+    previous_dataset_hash = st.session_state.get("preprocessing_last_dataset_hash")
+
+    reused = (
+        previous_signature
+        and previous_dataset_hash
+        and previous_signature == signature
+        and previous_dataset_hash == dataset_hash
+    )
+    cache_status = "reused" if reused else "recomputed"
+
+    st.session_state["preprocessing_last_signature"] = signature
+    st.session_state["preprocessing_last_dataset_hash"] = dataset_hash
+    st.session_state["preprocessing_payload_snapshot"] = payload
+    st.session_state["preprocessing_payload_json"] = normalized
+    st.session_state["preprocessing_cache_status"] = cache_status
+    st.session_state["preprocessing_last_run_time"] = datetime.utcnow().isoformat()
+
+    return {
+        "payload": payload,
+        "signature": signature,
+        "status": cache_status,
+        "dataset_hash": dataset_hash,
+    }
+
+
+def _mark_dataset_change(file_bytes: Optional[bytes] = None, dataset_state: Optional[DatasetState] = None) -> None:
+    file_hash = _compute_file_hash(file_bytes)
+    if not file_hash:
+        file_hash = _derive_dataset_hash_from_state(dataset_state)
+    st.session_state["dataset_file_hash"] = file_hash
+    st.session_state["preprocessing_cache_status"] = "dataset_changed"
+
+
+def _reset_preprocessing_tracking() -> None:
+    st.session_state["dataset_file_hash"] = None
+    st.session_state["preprocessing_cache_status"] = "not_run"
+    st.session_state["preprocessing_last_signature"] = ""
+    st.session_state["preprocessing_last_dataset_hash"] = None
+    st.session_state["preprocessing_payload_snapshot"] = None
+    st.session_state["preprocessing_payload_json"] = ""
+    st.session_state["preprocessing_last_run_time"] = ""
+
+
 def _refresh_inspection(state: Optional[DatasetState]) -> None:
     if not state:
         st.session_state["dataset_inspection"] = None
@@ -152,137 +327,6 @@ def _update_session_state(state: Optional[DatasetState], reset_roles: bool = Fal
         _clear_role_configuration()
 
 
-def _ensure_dataset_config_columns(columns: list[str]) -> None:
-    snapshot = st.session_state.get("dataset_config", {})
-    snapshot["available_columns"] = columns
-    column_roles = snapshot.get("column_roles", {})
-    filtered_roles = {
-        role: [col for col in selections if col in columns]
-        for role, selections in column_roles.items()
-        if selections
-    }
-    snapshot["column_roles"] = filtered_roles
-    st.session_state["dataset_config"] = snapshot
-
-
-def _render_inspection(inspect_result: DatasetInspectionResult) -> None:
-    st.subheader("Dataset Preview & Inspection")
-    preview_df = pd.DataFrame(inspect_result.preview.get("records", []))
-    if not preview_df.empty:
-        st.dataframe(preview_df, use_container_width=True)
-    else:
-        st.info("No preview records available")
-
-    dims = f"{inspect_result.row_count:,} rows × {inspect_result.column_count:,} columns"
-    st.markdown(f"**Dimensions:** {dims}")
-    metrics_col1, metrics_col2, metrics_col3 = st.columns(3)
-    metrics_col1.metric("Memory usage", f"{inspect_result.memory_usage_bytes:,} bytes")
-    metrics_col2.metric("Duplicate rows", f"{inspect_result.duplicate_row_count:,}")
-    metrics_col3.metric("Quality score", f"{inspect_result.quality_score * 100:.2f} / 100")
-
-    st.markdown("#### Schema")
-    st.table(pd.DataFrame(inspect_result.schema))
-
-    st.markdown("#### Datatype summary")
-    dtype_df = (
-        pd.DataFrame(
-            inspect_result.dtype_summary.items(), columns=["dtype", "count"]
-        )
-        .sort_values("count", ascending=False)
-        .reset_index(drop=True)
-    )
-    st.table(dtype_df)
-
-    st.markdown("#### Missing values")
-    missing_df = pd.DataFrame(
-        list(inspect_result.missing_value_counts.items()),
-        columns=["column", "missing_count"],
-    ).sort_values("missing_count", ascending=False)
-    st.table(missing_df)
-
-    st.markdown("#### Quality score breakdown")
-    inputs = inspect_result.quality_score_inputs
-    breakdown_df = pd.DataFrame(
-        {
-            "metric": [
-                "Missing ratio",
-                "Duplicate ratio",
-                "Rows",
-                "Columns",
-                "Missing values",
-                "Duplicate rows",
-            ],
-            "value": [
-                f"{inputs.missing_ratio:.4f}",
-                f"{inputs.duplicate_ratio:.4f}",
-                inputs.rows,
-                inputs.columns,
-                inputs.missing_values,
-                inputs.duplicate_rows,
-            ],
-        }
-    )
-    st.table(breakdown_df)
-
-
-def _render_role_configuration(columns: list[str]) -> None:
-    if not columns:
-        st.warning("No columns available for role configuration.")
-        return
-
-    st.markdown("### Column role configuration")
-    st.caption("Define how the dataset columns should be interpreted downstream without touching backend code.")
-    role_layouts = st.columns(2)
-
-    column_roles: Dict[str, list[str]] = {}
-    for idx, role_def in enumerate(ROLE_DEFINITIONS):
-        column_slot = role_layouts[idx % 2]
-        with column_slot:
-            role = role_def["role"]
-            label = role_def["label"]
-            key = f"dataset_role_{role}"
-            if role_def["multi"]:
-                previous = st.session_state.get(key, [])
-                default = [col for col in previous if col in columns]
-                selection = st.multiselect(
-                    label,
-                    options=columns,
-                    default=default,
-                    key=key,
-                )
-                if selection:
-                    column_roles[role] = selection
-            else:
-                options = [""] + columns
-                prev_value = st.session_state.get(key, "")
-                if prev_value in options:
-                    default_index = options.index(prev_value)
-                else:
-                    default_index = 0
-                value = st.selectbox(
-                    label,
-                    options,
-                    index=default_index,
-                    key=key,
-                )
-                if value:
-                    column_roles[role] = [value]
-
-    st.session_state["dataset_config"] = {
-        "column_roles": column_roles,
-        "available_columns": columns,
-    }
-    st.markdown("#### Current configuration")
-    st.json(st.session_state["dataset_config"], expanded=False)
-
-PREPROCESSING_SESSION_KEYS = {
-    "missing": "preprocessing_missing_strategy",
-    "outlier": "preprocessing_outlier_method",
-    "encoding": "preprocessing_encoding_strategy",
-    "scaling": "preprocessing_scaling_strategy",
-}
-
-
 def _ensure_preprocessing_session_state() -> None:
     for section, label in PREPROCESSING_LABEL_DEFAULTS.items():
         label_key = f"preprocessing_label_override_{section}"
@@ -297,65 +341,13 @@ def _ensure_preprocessing_session_state() -> None:
             st.session_state[selector_key] = default_value
 
 
-def _build_missing_config(selection: str) -> Dict[str, Any]:
-    mapping: Dict[str, Any] = {}
-    if selection == "drop rows":
-        mapping["strategy"] = "drop"
-        mapping["how"] = "any"
-    elif selection == "drop columns":
-        mapping["strategy"] = "drop"
-        mapping["how"] = "any"
-        mapping["axis"] = 1
-    elif selection == "mean":
-        mapping["strategy"] = "mean"
-    elif selection == "median":
-        mapping["strategy"] = "median"
-    elif selection == "mode":
-        mapping["strategy"] = "most_frequent"
-    elif selection == "constant":
-        mapping["strategy"] = "constant"
-    elif selection == "KNN Imputer":
-        mapping["strategy"] = "knn"
-    elif selection == "Iterative Imputer":
-        mapping["strategy"] = "iterative"
-    elif selection == "forward fill":
-        mapping["strategy"] = "ffill"
-    elif selection == "backward fill":
-        mapping["strategy"] = "bfill"
-    return mapping
-
-
-def _build_outlier_config(selection: str) -> Dict[str, Any]:
-    method_map = {
-        "none": "none",
-        "IQR": "iqr",
-        "Z-score": "zscore",
-        "Isolation Forest": "isolation_forest",
-        "Local Outlier Factor": "local_outlier_factor",
-        "Winsorization": "winsorization",
-    }
-    return {"method": method_map.get(selection, "none")}
-
-
-def _build_encoding_config(selection: str, columns: list[str]) -> Dict[str, Any]:
-    config: Dict[str, Any] = {"strategy": selection if selection != "none" else "none"}
-    if columns:
-        config["columns"] = columns
-    return config
-
-
-def _build_scaling_config(selection: str, columns: list[str]) -> Dict[str, Any]:
-    config: Dict[str, Any] = {"strategy": selection if selection != "none" else "none"}
-    if columns:
-        config["columns"] = columns
-    return config
-
-
 if "dataset_state" not in st.session_state:
     st.session_state["dataset_state"] = None
     st.session_state["dataset_inspection"] = None
     st.session_state["inspection_error"] = ""
     st.session_state["dataset_config"] = {"column_roles": {}, "available_columns": []}
+    st.session_state["dataset_display_name"] = ""
+    _reset_preprocessing_tracking()
 
 _ensure_preprocessing_session_state()
 
@@ -393,6 +385,8 @@ with st.container():
                             config=DEFAULT_INGEST_CONFIG,
                         )
                         _update_session_state(state, reset_roles=True)
+                        st.session_state["dataset_display_name"] = dataset_name_input
+                        _mark_dataset_change(file_bytes=file_bytes, dataset_state=state)
                         st.success("Dataset uploaded successfully.")
                     except Exception as exc:
                         st.error(f"Failed to ingest dataset: {exc}")
@@ -404,13 +398,16 @@ with st.container():
                     st.warning("No dataset exists yet. Use Upload instead.")
                 else:
                     try:
+                        file_bytes = uploaded_file.getvalue()
                         state = replace_dataset(
                             dataset_id=DATASET_ID,
                             file_name=uploaded_file.name,
-                            file_bytes=uploaded_file.getvalue(),
+                            file_bytes=file_bytes,
                             config=DEFAULT_INGEST_CONFIG,
                         )
                         _update_session_state(state, reset_roles=True)
+                        st.session_state["dataset_display_name"] = dataset_name_input
+                        _mark_dataset_change(file_bytes=file_bytes, dataset_state=state)
                         st.success("Dataset replaced successfully.")
                     except Exception as exc:
                         st.error(f"Failed to replace dataset: {exc}")
@@ -427,6 +424,7 @@ with st.container():
                             dataset_id=DATASET_ID, config=DEFAULT_INGEST_CONFIG
                         )
                         _update_session_state(state)
+                        _mark_dataset_change(state=state)
                         st.success("Dataset reloaded with latest configuration.")
                     except Exception as exc:
                         st.error(f"Reload failed: {exc}")
@@ -438,6 +436,7 @@ with st.container():
                     try:
                         remove_dataset(dataset_id=DATASET_ID)
                         _update_session_state(None, reset_roles=True)
+                        _reset_preprocessing_tracking()
                         st.info("Dataset removed from memory.")
                     except Exception as exc:
                         st.error(f"Failed to remove dataset: {exc}")
@@ -460,6 +459,8 @@ with st.container():
                         config=DEFAULT_INGEST_CONFIG,
                     )
                     _update_session_state(state, reset_roles=True)
+                    st.session_state["dataset_display_name"] = f"Sample - {sample_choice}"
+                    _mark_dataset_change(file_bytes=sample_bytes, dataset_state=state)
                     st.success("Sample dataset loaded for quick experimentation.")
                 except Exception as exc:
                     st.error(f"Sample dataset ingestion failed: {exc}")
@@ -472,53 +473,64 @@ state = st.session_state["dataset_state"]
 inspection = st.session_state["dataset_inspection"]
 inspection_error = st.session_state["inspection_error"]
 
-two_column_layout = st.columns([3, 1])
-with two_column_layout[0]:
-    if not state:
-        st.info("No dataset is available yet. Upload, replace, or load a sample dataset to continue.")
-    elif inspection_error:
-        st.error(inspection_error)
-    elif inspection:
-        _render_inspection(inspection)
-    else:
-        st.warning("Dataset is loaded but inspection is pending.")
+st.markdown("---")
 
-with two_column_layout[1]:
-    st.subheader("Quick Sampling & Stats")
-    if state and inspection:
-        sample_size = st.slider("Sample rows", min_value=5, max_value=100, value=10)
-        if st.button("Generate random preview sample"):
-            try:
-                preview_df = pd.DataFrame(inspection.preview.get("records", []))
-                if preview_df.empty:
-                    st.warning("No data available for sampling yet.")
-                else:
-                    sampled = preview_df.sample(n=min(sample_size, len(preview_df)), replace=False, random_state=42)
-                    st.dataframe(sampled)
-            except ValueError as exc:
-                st.warning(f"Unable to sample dataset: {exc}")
-    else:
-        st.info("Sampling will become available once a dataset is inspected.")
-
-if state and inspection:
-    columns = state.dataframe.columns.tolist()
-    _ensure_dataset_config_columns(columns)
-    _render_role_configuration(columns)
-else:
-    st.markdown("---")
-    st.markdown("### Dataset role configuration")
-    st.info("Configure column roles once a dataset is available.")
-
-preprocessing_section = st.container()
-with preprocessing_section:
-    st.markdown("---")
+with st.container():
     st.markdown("### Preprocessing configuration panel")
     st.caption("Drive missing value, outlier, encoding, and scaling choices directly from the browser without touching backend code.")
 
     with st.expander("Customize panel labels & defaults", expanded=False):
         st.write("Use these controls to rename sections or change the defaults that feed into the preprocessing panel on every rerun.")
         label_cols = st.columns(2)
-        for idx, key in enumerate(PREPROCESSI... (truncated for brevity)
+        for idx, key in enumerate(PREPROCESSING_SESSION_KEYS):
+            pass
+
+    st.markdown("---")
+    st.markdown("#### Preprocessing run & cache insights")
+    cache_status = st.session_state.get("preprocessing_cache_status", "not_run")
+    dataset_columns = _extract_dataframe_columns(state)
+    dataset_hash = st.session_state.get("dataset_file_hash")
+    last_signature = st.session_state.get("preprocessing_last_signature", "")
+    last_run_time = st.session_state.get("preprocessing_last_run_time", "")
+
+    status_col1, status_col2, status_col3 = st.columns([2, 1, 1])
+    status_message = CACHE_STATUS_COPY.get(cache_status, "Cache status pending.")
+    emoji = {
+        "not_run": "⚪️",
+        "dataset_changed": "⚠️",
+        "reused": "✅",
+        "recomputed": "🔄",
+    }.get(cache_status, "ℹ️")
+    with status_col1:
+        st.markdown(f"**{emoji} {status_message}**")
+        if not dataset_columns:
+            st.caption("Dataset not available yet. Upload, reload, or sample to unlock preprocessing runs.")
+        else:
+            st.caption("Use the button below to rerun preprocessing once the configuration looks right.")
+    with status_col2:
+        st.markdown("**Dataset fingerprint**")
+        st.code(dataset_hash or "No dataset fingerprinting information yet")
+    with status_col3:
+        st.markdown("**Last preprocessing run**")
+        st.write(last_run_time or "Not run yet")
+
+    run_disabled = not dataset_columns
+    if st.button("Run preprocessing with current configuration", disabled=run_disabled, key="preprocessing_run"):
+        run_result = _prepare_cache_payload(dataset_columns)
+        if run_result["status"] == "reused":
+            st.success("Cached preprocessing results reused — no recomputation required.")
+        else:
+            st.info("Preprocessing recomputed; cache context has been refreshed.")
+
+    payload_snapshot = st.session_state.get("preprocessing_payload_snapshot")
+    payload_json = st.session_state.get("preprocessing_payload_json")
+    if payload_snapshot and payload_json:
+        with st.expander("Payload sent to backend cache layer", expanded=False):
+            st.json(payload_snapshot)
+            st.caption("This JSON blob is hashed on the backend to key preprocessing cache entries.")
+            st.code(payload_json)
+    else:
+        st.info("Preprocessing payload will appear here once you run a cache-aware preprocessing job.")
 
 analysis_section = st.container()
 with analysis_section:
