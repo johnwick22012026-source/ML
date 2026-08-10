@@ -310,6 +310,11 @@ def _normalize_payload(payload: Any) -> Any:
     return str(payload)
 
 
+def _build_cache_signature(payload: Any) -> str:
+    normalized = json.dumps(_normalize_payload(payload), sort_keys=True)
+    return hashlib.sha256(normalized.encode()).hexdigest()
+
+
 def _parse_int_list(raw: str) -> list[int]:
     if not raw:
         return []
@@ -366,6 +371,13 @@ def _ensure_feature_engineering_session_state() -> None:
     for key, default in FEATURE_ENGINEERING_DEFAULTS.items():
         if key not in st.session_state:
             st.session_state[key] = default
+
+
+def _ensure_validation_session_state() -> None:
+    if "validation_last_signature" not in st.session_state:
+        st.session_state["validation_last_signature"] = ""
+    if "validation_last_run_time" not in st.session_state:
+        st.session_state["validation_last_run_time"] = ""
 
 
 def _build_feature_engineering_payload(columns: list[str]) -> Dict[str, Any]:
@@ -489,6 +501,8 @@ def _mark_dataset_change(file_bytes: Optional[bytes] = None, dataset_state: Opti
         file_hash = _derive_dataset_hash_from_state(dataset_state)
     st.session_state["dataset_file_hash"] = file_hash
     st.session_state["preprocessing_cache_status"] = "dataset_changed"
+    st.session_state["validation_last_signature"] = ""
+    st.session_state["eda_last_signature"] = ""
 
 
 def _reset_preprocessing_tracking() -> None:
@@ -504,6 +518,8 @@ def _reset_preprocessing_tracking() -> None:
 def _reset_validation_state() -> None:
     st.session_state["dataset_validation_result"] = None
     st.session_state["validation_error"] = ""
+    st.session_state["validation_last_signature"] = ""
+    st.session_state["validation_last_run_time"] = ""
 
 
 def _run_validation_flow(state: DatasetState) -> None:
@@ -556,6 +572,8 @@ def _initialize_eda_session_state() -> None:
         st.session_state["eda_scatter_pairs"] = []
     if "eda_active_view" not in st.session_state:
         st.session_state["eda_active_view"] = EDA_VIEW_CHOICES[0]
+    if "eda_last_signature" not in st.session_state:
+        st.session_state["eda_last_signature"] = ""
 
 
 def _reset_eda_state() -> None:
@@ -564,6 +582,7 @@ def _reset_eda_state() -> None:
     st.session_state["eda_last_run_time"] = ""
     st.session_state["eda_scatter_pairs"] = []
     st.session_state["eda_active_view"] = EDA_VIEW_CHOICES[0]
+    st.session_state["eda_last_signature"] = ""
 
 
 def _get_dataframe_from_state(state: Optional[DatasetState]) -> Optional[pd.DataFrame]:
@@ -594,7 +613,9 @@ def _get_dataframe_for_view(
             try:
                 df = pd.DataFrame(preview_records)
                 if preview_columns:
-                    df = df[preview_columns]
+                    safe_columns = [col for col in preview_columns if col in df.columns]
+                    if safe_columns:
+                        df = df[safe_columns]
                 return df
             except Exception:
                 pass
@@ -620,8 +641,8 @@ def _build_eda_config() -> Dict[str, Any]:
     }
 
 
-def _run_eda(df: pd.DataFrame) -> Dict[str, Any]:
-    config = _build_eda_config()
+def _run_eda(df: pd.DataFrame, config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    config = config or _build_eda_config()
     service = EDAService()
     return service.analyze(df, config)
 
@@ -716,6 +737,15 @@ def _clear_pair_selection() -> None:
     st.session_state["eda_scatter_pairs"] = []
 
 
+def _build_validation_signature(state: Optional[DatasetState]) -> str:
+    dataset_hash = st.session_state.get("dataset_file_hash") or _derive_dataset_hash_from_state(state)
+    payload = {
+        "dataset_hash": dataset_hash,
+        "config": DEFAULT_INGEST_CONFIG,
+    }
+    return _build_cache_signature(payload)
+
+
 if "dataset_state" not in st.session_state:
     st.session_state["dataset_state"] = None
     st.session_state["dataset_inspection"] = None
@@ -728,6 +758,7 @@ if "dataset_state" not in st.session_state:
 _ensure_preprocessing_session_state()
 _ensure_feature_engineering_session_state()
 _initialize_eda_session_state()
+_ensure_validation_session_state()
 
 
 def _update_session_state(state: Optional[DatasetState], reset_roles: bool = False) -> None:
@@ -863,6 +894,11 @@ inspection_error = st.session_state["inspection_error"]
 validation_result = st.session_state.get("dataset_validation_result")
 validation_error = st.session_state.get("validation_error", "")
 
+validation_signature = _build_validation_signature(state)
+cached_validation_signature = st.session_state.get("validation_last_signature", "")
+
+validation_last_run_time = st.session_state.get("validation_last_run_time", "")
+
 dataset_columns = _extract_dataframe_columns(state)
 
 with st.container():
@@ -874,9 +910,19 @@ with st.container():
             if not state:
                 st.warning("Load or upload a dataset before validating.")
             else:
-                _run_validation_flow(state)
-                if st.session_state.get("dataset_validation_result"):
-                    st.success("Dataset validation completed and cached for this run.")
+                if (
+                    validation_signature
+                    and cached_validation_signature
+                    and validation_signature == cached_validation_signature
+                    and validation_result
+                ):
+                    st.success("Validation cached results reused — input and configuration unchanged.")
+                else:
+                    _run_validation_flow(state)
+                    if st.session_state.get("dataset_validation_result"):
+                        st.session_state["validation_last_signature"] = validation_signature
+                        st.session_state["validation_last_run_time"] = datetime.utcnow().isoformat()
+                        st.success("Dataset validation completed and cached for this run.")
     with validation_col2:
         if validation_error:
             st.error(validation_error)
@@ -884,6 +930,8 @@ with st.container():
             st.success("Latest validation run available below.")
         else:
             st.info("Run validation to inspect dataset health indicators.")
+        if validation_last_run_time:
+            st.caption(f"Last validation run: {validation_last_run_time}")
 
     if validation_result:
         st.markdown("#### Preview")
@@ -891,14 +939,18 @@ with st.container():
         preview_records = validation_result.preview.get("records", [])
         if preview_records:
             preview_df = pd.DataFrame(preview_records)
-            st.dataframe(preview_df[preview_columns], use_container_width=True)
+            safe_preview_columns = [col for col in preview_columns if col in preview_df.columns]
+            if safe_preview_columns:
+                st.dataframe(preview_df[safe_preview_columns], use_container_width=True)
+            else:
+                st.dataframe(preview_df, use_container_width=True)
         else:
             st.info("No rows available in the preview.")
 
         st.markdown("#### Schema & Dtypes")
         schema_df = pd.DataFrame(validation_result.schema)
         st.dataframe(schema_df, use_container_width=True)
-        dtype_summary = validation_result.dtype_summary
+        dtype_summary = validation_result.dtype_summary or {}
         st.markdown("#### Dimension & Memory Signature")
         metrics_row = st.columns(4)
         metrics_row[0].metric("Rows", validation_result.dimensions.get("rows", 0))
@@ -907,9 +959,15 @@ with st.container():
         metrics_row[3].metric("Quality score", f"{validation_result.quality_score * 100:.1f}%")
 
         st.markdown("#### Type distribution")
-        dtype_items = [{"dtype": key, "count": value} for key, value in dtype_summary.items()]
-        dtype_df = pd.DataFrame(dtype_items)
-        st.bar_chart(dtype_df.set_index("dtype"))
+        if dtype_summary:
+            dtype_items = [{"dtype": key, "count": value} for key, value in dtype_summary.items()]
+            dtype_df = pd.DataFrame(dtype_items)
+            if not dtype_df.empty and "dtype" in dtype_df.columns and "count" in dtype_df.columns:
+                st.bar_chart(dtype_df.set_index("dtype"))
+            else:
+                st.info("Type distribution data is unavailable or incomplete.")
+        else:
+            st.info("Type distribution data is unavailable or incomplete.")
 
         st.markdown("#### Missing & Duplicate insights")
         insights_col1, insights_col2 = st.columns(2)
@@ -1280,19 +1338,38 @@ with st.container():
             key="eda_correlation_method",
         )
 
+        eda_config = _build_eda_config()
+        eda_signature = _build_cache_signature(
+            {
+                "dataset_hash": st.session_state.get("dataset_file_hash"),
+                "view": active_view,
+                "config": eda_config,
+            }
+        )
+        cached_eda_signature = st.session_state.get("eda_last_signature", "")
+
         run_disabled = df_for_eda is None or df_for_eda.empty
         button_label = "Generate exploratory analysis"
         if st.button(button_label, disabled=run_disabled, key="eda_run"):
-            try:
-                with st.spinner("Hydrating EDA artifacts..."):
-                    eda_payload = _run_eda(df_for_eda)
-                st.session_state["eda_result"] = eda_payload
-                st.session_state["eda_error"] = ""
-                st.session_state["eda_last_run_time"] = datetime.utcnow().isoformat()
-                st.success("Exploratory analysis complete — charts are ready below.")
-            except Exception as exc:
-                st.session_state["eda_error"] = f"EDA failed: {exc}"
-                st.session_state["eda_result"] = None
+            if (
+                eda_signature
+                and cached_eda_signature
+                and eda_signature == cached_eda_signature
+                and st.session_state.get("eda_result")
+            ):
+                st.success("EDA artifacts reused from cache — no recomputation required.")
+            else:
+                try:
+                    with st.spinner("Hydrating EDA artifacts..."):
+                        eda_payload = _run_eda(df_for_eda, config=eda_config)
+                    st.session_state["eda_result"] = eda_payload
+                    st.session_state["eda_error"] = ""
+                    st.session_state["eda_last_run_time"] = datetime.utcnow().isoformat()
+                    st.session_state["eda_last_signature"] = eda_signature
+                    st.success("Exploratory analysis complete — charts are ready below.")
+                except Exception as exc:
+                    st.session_state["eda_error"] = f"EDA failed: {exc}"
+                    st.session_state["eda_result"] = None
         if st.session_state.get("eda_error"):
             st.error(st.session_state.get("eda_error"))
         if st.session_state.get("eda_last_run_time"):
