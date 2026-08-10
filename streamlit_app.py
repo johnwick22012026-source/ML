@@ -2,7 +2,7 @@ import hashlib
 import io
 import json
 from datetime import datetime
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -11,6 +11,7 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from backend.eda import EDAService
+from backend.ml import ModelRegistry
 from backend.services.dataset_inspection import DatasetInspectionResult, inspect_dataset
 from backend.services.ingestion import (
     DatasetState,
@@ -175,6 +176,39 @@ ML_TASK_DISPLAY_NAMES: Dict[str, str] = {
     "anomaly_detection": "Anomaly Detection",
 }
 
+SUPPORTED_MODEL_TASKS = ["regression", "classification"]
+
+MODEL_HYPERPARAMETER_TEMPLATES: Dict[str, List[Dict[str, Any]]] = {
+    "linear_regression": [
+        {"name": "fit_intercept", "type": "bool", "default": True},
+    ],
+    "random_forest_regressor": [
+        {"name": "n_estimators", "type": "int", "default": 100, "min": 10, "max": 1000, "step": 10},
+        {"name": "max_depth", "type": "int", "default": 5, "min": 1, "max": 50, "step": 1},
+        {"name": "random_state", "type": "int", "default": 42, "min": 0, "max": 9999, "step": 1},
+    ],
+    "svr": [
+        {"name": "kernel", "type": "select", "default": "rbf", "options": ["rbf", "linear", "poly", "sigmoid"]},
+        {"name": "C", "type": "float", "default": 1.0, "min": 0.01, "max": 100.0, "step": 0.1},
+        {"name": "epsilon", "type": "float", "default": 0.1, "min": 0.0, "max": 1.0, "step": 0.01},
+    ],
+    "logistic_regression": [
+        {"name": "C", "type": "float", "default": 1.0, "min": 0.01, "max": 100.0, "step": 0.1},
+        {"name": "max_iter", "type": "int", "default": 100, "min": 50, "max": 1000, "step": 50},
+        {"name": "solver", "type": "select", "default": "lbfgs", "options": ["lbfgs", "liblinear", "sag"]},
+    ],
+    "random_forest_classifier": [
+        {"name": "n_estimators", "type": "int", "default": 100, "min": 10, "max": 1000, "step": 10},
+        {"name": "max_depth", "type": "int", "default": 5, "min": 1, "max": 50, "step": 1},
+        {"name": "random_state", "type": "int", "default": 42, "min": 0, "max": 9999, "step": 1},
+    ],
+    "svc": [
+        {"name": "kernel", "type": "select", "default": "rbf", "options": ["rbf", "linear", "poly", "sigmoid"]},
+        {"name": "C", "type": "float", "default": 1.0, "min": 0.01, "max": 100.0, "step": 0.1},
+        {"name": "gamma", "type": "select", "default": "scale", "options": ["scale", "auto"]},
+    ],
+}
+
 
 def _format_ml_task_label(value: str) -> str:
     return ML_TASK_DISPLAY_NAMES.get(value, value.replace("_", " ").title())
@@ -190,6 +224,7 @@ def _build_runtime_ml_engine_configuration(payload: Dict[str, Any]) -> Dict[str,
     runtime_config = {
         "task_type": task_type,
         "preprocessing": payload,
+        "models": _collect_selected_model_configs(),
         "generated_at": datetime.utcnow().isoformat(),
     }
     st.session_state["ml_engine_configuration"] = runtime_config
@@ -342,6 +377,68 @@ def _build_preprocessing_payload(columns: list[str]) -> Dict[str, Any]:
     return payload
 
 
+def _build_feature_engineering_payload(columns: list[str]) -> Dict[str, Any]:
+    _ensure_feature_engineering_session_state()
+    payload: Dict[str, Any] = {
+        "columns": columns,
+        "feature_engineering_enabled": st.session_state["feature_engineering_enabled"],
+        "polynomial": {
+            "enabled": st.session_state["fe_polynomial_enabled"],
+            "columns": st.session_state["fe_polynomial_columns"],
+            "degree": st.session_state["fe_polynomial_degree"],
+            "include_bias": st.session_state["fe_polynomial_include_bias"],
+            "interaction_only": st.session_state["fe_polynomial_interaction_only"],
+        },
+        "interaction": {
+            "enabled": st.session_state["fe_interaction_enabled"],
+            "columns": st.session_state["fe_interaction_columns"],
+        },
+        "lags": {
+            "enabled": st.session_state["fe_lag_enabled"],
+            "columns": st.session_state["fe_lag_columns"],
+            "max_lag": st.session_state["fe_lag_max_lag"],
+            "fill_value": st.session_state["fe_lag_fill_value"],
+        },
+        "rolling": {
+            "enabled": st.session_state["fe_rolling_enabled"],
+            "columns": st.session_state["fe_rolling_columns"],
+            "windows": _parse_int_list(st.session_state.get("fe_rolling_windows", "")),
+            "stats": st.session_state["fe_rolling_stats"],
+        },
+        "date": {
+            "enabled": st.session_state["fe_date_enabled"],
+            "column": st.session_state["fe_date_column"],
+            "features": st.session_state["fe_date_features"],
+            "drop_original": st.session_state["fe_date_drop_original"],
+        },
+        "holiday": {
+            "enabled": st.session_state["fe_holiday_enabled"],
+            "column": st.session_state["fe_holiday_column"],
+            "calendars": st.session_state["fe_holiday_calendars"],
+            "custom": st.session_state["fe_holiday_custom"],
+        },
+        "cyclical": {
+            "enabled": st.session_state["fe_cyclical_enabled"],
+            "columns": st.session_state["fe_cyclical_columns"],
+            "max_value": st.session_state["fe_cyclical_max_value"],
+        },
+        "pca": {
+            "enabled": st.session_state["fe_pca_enabled"],
+            "columns": st.session_state["fe_pca_columns"],
+            "n_components": st.session_state["fe_pca_n_components"],
+            "whiten": st.session_state["fe_pca_whiten"],
+        },
+        "feature_selection": {
+            "enabled": st.session_state["fe_feature_selection_enabled"],
+            "columns": st.session_state["fe_feature_selection_columns"],
+            "method": st.session_state["fe_feature_selection_method"],
+            "top_k": st.session_state["fe_feature_selection_top_k"],
+            "threshold": st.session_state["fe_feature_selection_threshold"],
+        },
+    }
+    return payload
+
+
 def _normalize_payload(payload: Any) -> Any:
     if isinstance(payload, dict):
         return {key: _normalize_payload(payload[key]) for key in sorted(payload)}
@@ -422,3 +519,124 @@ def _ensure_validation_session_state() -> None:
         st.session_state["validation_last_signature"] = ""
     if "validation_last_run_time" not in st.session_state:
         st.session_state["validation_last_run_time"] = ""
+
+
+def _ensure_model_selection_session_state() -> None:
+    if "active_task_type" not in st.session_state:
+        st.session_state["active_task_type"] = SUPPORTED_MODEL_TASKS[0]
+    for task in SUPPORTED_MODEL_TASKS:
+        key = f"selected_models_{task}"
+        if key not in st.session_state:
+            options = ModelRegistry.available_models(task)
+            st.session_state[key] = options[:1] if options else []
+
+
+def _collect_selected_model_configs() -> List[Dict[str, Any]]:
+    task_type = st.session_state.get("active_task_type", SUPPORTED_MODEL_TASKS[0])
+    selection_key = f"selected_models_{task_type}"
+    selected_models = st.session_state.get(selection_key, [])
+    model_configs: List[Dict[str, Any]] = []
+    for model_name in selected_models:
+        hyperparameters: Dict[str, Any] = {}
+        for param in MODEL_HYPERPARAMETER_TEMPLATES.get(model_name, []):
+            state_key = f"model_hyper_{model_name}_{param['name']}"
+            if state_key not in st.session_state:
+                st.session_state[state_key] = param.get("default")
+            hyperparameters[param["name"]] = st.session_state[state_key]
+        model_configs.append({"name": model_name, "hyperparameters": hyperparameters})
+    return model_configs
+
+
+def _render_model_hyperparameter_inputs(model_name: str) -> None:
+    parameters = MODEL_HYPERPARAMETER_TEMPLATES.get(model_name, [])
+    if not parameters:
+        st.caption("This model only uses default hyperparameters.")
+        return
+
+    for param in parameters:
+        state_key = f"model_hyper_{model_name}_{param['name']}"
+        if state_key not in st.session_state:
+            st.session_state[state_key] = param.get("default")
+        label = param.get("label", param["name"].replace("_", " ").title())
+        input_kwargs: Dict[str, Any] = {
+            "label": label,
+            "key": state_key,
+            "on_change": _handle_task_selection_change,
+        }
+        if param["type"] == "bool":
+            st.checkbox(
+                value=bool(st.session_state[state_key]),
+                **input_kwargs,
+            )
+        elif param["type"] in {"int", "float"}:
+            min_value = param.get("min")
+            max_value = param.get("max")
+            step = param.get("step")
+            if min_value is not None:
+                input_kwargs["min_value"] = min_value
+            if max_value is not None:
+                input_kwargs["max_value"] = max_value
+            if step is not None:
+                input_kwargs["step"] = step
+            if param["type"] == "int":
+                input_kwargs["value"] = int(st.session_state[state_key])
+                st.number_input(**input_kwargs)
+            else:
+                input_kwargs["value"] = float(st.session_state[state_key])
+                st.number_input(**input_kwargs)
+        elif param["type"] == "select":
+            options = param.get("options", [])
+            default = st.session_state[state_key]
+            if default not in options and options:
+                st.session_state[state_key] = options[0]
+                default = options[0]
+            st.selectbox(
+                label,
+                options=options,
+                index=options.index(default) if options else 0,
+                key=state_key,
+                on_change=_handle_task_selection_change,
+            )
+        else:
+            st.text_input(
+                label,
+                value=str(st.session_state[state_key]),
+                key=state_key,
+                on_change=_handle_task_selection_change,
+            )
+
+
+def _render_model_selection_panel() -> None:
+    _ensure_model_selection_session_state()
+    with st.sidebar.expander("Model selection & hyperparameters", expanded=True):
+        current_task = st.session_state.get("active_task_type", SUPPORTED_MODEL_TASKS[0])
+        task_index = SUPPORTED_MODEL_TASKS.index(current_task) if current_task in SUPPORTED_MODEL_TASKS else 0
+        st.radio(
+            "Select task type",
+            options=SUPPORTED_MODEL_TASKS,
+            format_func=_format_ml_task_label,
+            index=task_index,
+            key="active_task_type",
+            on_change=_handle_task_selection_change,
+        )
+        available_models = ModelRegistry.available_models(st.session_state["active_task_type"])
+        selection_key = f"selected_models_{st.session_state['active_task_type']}"
+        default_models = st.session_state.get(selection_key, available_models[:1])
+        st.multiselect(
+            "Algorithms",
+            options=available_models,
+            default=default_models,
+            key=selection_key,
+            help="Pick one or more algorithms to train for the selected task.",
+            on_change=_handle_task_selection_change,
+        )
+        selected = st.session_state.get(selection_key, [])
+        if not selected:
+            st.warning("Select at least one model before running training or prediction.")
+        for model_name in selected:
+            with st.expander(f"{model_name.replace('_', ' ').title()} hyperparameters", expanded=False):
+                _render_model_hyperparameter_inputs(model_name)
+
+
+# Additional UI initialization for model configuration
+_render_model_selection_panel()
