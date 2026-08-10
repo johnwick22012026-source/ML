@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import warnings
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 import numpy as np
 import pandas as pd
+import streamlit as st
 from sklearn.exceptions import ConvergenceWarning
 from sklearn.impute import IterativeImputer, KNNImputer, SimpleImputer
 from sklearn.linear_model import BayesianRidge
@@ -121,7 +124,7 @@ def _apply_encoding(
         return df
 
     if strategy == "one_hot":
-        encoder = OneHotEncoder(sparse_output=False, handle_unknown="ignore")
+        encoder = OneHotEncoder(sparse=False, handle_unknown="ignore")
         encoded = encoder.fit_transform(df[categorical].astype(str))
         columns = encoder.get_feature_names_out(categorical)
         encoded_df = pd.DataFrame(encoded, columns=columns, index=df.index)
@@ -163,63 +166,130 @@ def _apply_scaling(
     return df, scaler
 
 
+def _normalize_config(config: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    def _normalize_value(value: Any) -> Any:
+        if isinstance(value, dict):
+            return {key: _normalize_value(value[key]) for key in sorted(value)}
+        if isinstance(value, (list, tuple)):
+            return [_normalize_value(item) for item in value]
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            return value
+        return str(value)
+
+    return _normalize_value(config or {})  # type: ignore[arg-type]
+
+
+def _hash_dataframe(df: pd.DataFrame) -> str:
+    try:
+        hashed = pd.util.hash_pandas_object(df, index=True).values
+        digest = hashlib.sha256(hashed.tobytes()).hexdigest()
+    except Exception:
+        digest = hashlib.sha256(df.to_csv(index=False).encode()).hexdigest()
+    return digest
+
+
+def _config_signature(config_json: str) -> str:
+    return hashlib.sha256(config_json.encode()).hexdigest()
+
+
+@dataclass(frozen=True)
+class PreprocessingBlueprint:
+    signature: str
+    normalized_config: Dict[str, Any]
+
+
+@st.cache_resource
+def _build_preprocessing_blueprint(config_json: str) -> PreprocessingBlueprint:
+    normalized = json.loads(config_json)
+    signature = _config_signature(config_json)
+    return PreprocessingBlueprint(signature=signature, normalized_config=normalized)
+
+
+def _apply_preprocessing_pipeline(df: pd.DataFrame, config: Dict[str, Any]) -> Dict[str, Any]:
+    metadata: Dict[str, Any] = {"steps": []}
+
+    numeric_cols, categorical_cols = _collect_column_groups(df)
+
+    missing_cfg = config.get("missing_value", {})
+    if missing_cfg:
+        strategy = missing_cfg.get("strategy", "none")
+        metadata["missing_value"] = {"strategy": strategy}
+        if strategy in {"mean", "median", "most_frequent", "constant"}:
+            fill = missing_cfg.get("fill_value")
+            df = _apply_simple_imputer(df, numeric_cols, strategy, fill)
+        elif strategy == "knn":
+            n_neighbors = missing_cfg.get("n_neighbors", 5)
+            df = _apply_knn_imputer(df, numeric_cols, n_neighbors)
+        elif strategy == "iterative":
+            max_iter = missing_cfg.get("max_iter", 10)
+            tol = missing_cfg.get("tol", 1e-3)
+            df = _apply_iterative_imputer(df, numeric_cols, max_iter=max_iter, tol=tol)
+        elif strategy == "drop":
+            df = df.dropna(axis=0, how=missing_cfg.get("how", "any"))
+        metadata["missing_value"].update({"filled_columns": numeric_cols})
+
+    outlier_cfg = config.get("outlier", {})
+    if outlier_cfg:
+        method = outlier_cfg.get("method", "none")
+        if method != "none":
+            metadata.setdefault("outlier", {}).update({"method": method})
+            df, removed = _apply_outlier_limits(df, numeric_cols, method, outlier_cfg)
+            metadata["outlier"]["columns_affected"] = list(removed)
+
+    encoding_cfg = config.get("encoding", {})
+    encoding_strategy = encoding_cfg.get("strategy", "none")
+    if encoding_cfg and encoding_strategy != "none":
+        metadata.setdefault("encoding", {}).update(
+            {"strategy": encoding_strategy, "columns": categorical_cols}
+        )
+        df = _apply_encoding(df, encoding_strategy, categorical_cols, encoding_cfg)
+        numeric_cols, categorical_cols = _collect_column_groups(df)
+
+    scaling_cfg = config.get("scaling", {})
+    scaling_strategy = scaling_cfg.get("strategy", "none")
+    if scaling_cfg and scaling_strategy != "none":
+        metadata.setdefault("scaling", {}).update({"strategy": scaling_strategy})
+        df, scaler = _apply_scaling(df, scaling_strategy, numeric_cols, scaling_cfg)
+        if scaler is not None:
+            metadata["scaling"]["scaler"] = scaler.__class__.__name__ if hasattr(scaler, "__class__") else None
+
+    metadata["columns"] = list(df.columns)
+    return {"data": df, "metadata": metadata}
+
+
+@st.cache_data(show_spinner=False)
+def _cached_preprocessing(
+    dataframe: pd.DataFrame,
+    data_signature: str,
+    dataset_id: str,
+    config_json: str,
+) -> Dict[str, Any]:
+    df = dataframe.copy()
+    blueprint = _build_preprocessing_blueprint(config_json)
+    result = _apply_preprocessing_pipeline(df, blueprint.normalized_config)
+    result["metadata"]["config_signature"] = blueprint.signature
+    result["metadata"]["dataset_id"] = dataset_id
+    result["metadata"]["data_signature"] = data_signature
+    return result
+
+
 @dataclass
 class PreprocessingService:
     """Entry point for configuration driven preprocessing operations."""
 
-    def run(self, data: Any, config: Dict[str, Any]) -> Dict[str, Any]:
+    def run(self, data: Any, config: Dict[str, Any], dataset_id: str = "") -> Dict[str, Any]:
         """Applies configured preprocessing steps to the provided dataset."""
         if data is None:
             return {"data": data, "metadata": {"steps": []}}
 
         df = pd.DataFrame(data) if not isinstance(data, pd.DataFrame) else data.copy()
+        normalized_config = _normalize_config(config)
+        config_json = json.dumps(normalized_config, sort_keys=True)
+        data_signature = _hash_dataframe(df)
 
-        metadata: Dict[str, Any] = {"steps": []}
-
-        numeric_cols, categorical_cols = _collect_column_groups(df)
-
-        missing_cfg = config.get("missing_value", {})
-        if missing_cfg:
-            strategy = missing_cfg.get("strategy", "none")
-            metadata["missing_value"] = {"strategy": strategy}
-            if strategy in {"mean", "median", "most_frequent", "constant"}:
-                fill = missing_cfg.get("fill_value")
-                df = _apply_simple_imputer(df, numeric_cols, strategy, fill)
-            elif strategy == "knn":
-                n_neighbors = missing_cfg.get("n_neighbors", 5)
-                df = _apply_knn_imputer(df, numeric_cols, n_neighbors)
-            elif strategy == "iterative":
-                max_iter = missing_cfg.get("max_iter", 10)
-                tol = missing_cfg.get("tol", 1e-3)
-                df = _apply_iterative_imputer(df, numeric_cols, max_iter=max_iter, tol=tol)
-            elif strategy == "drop":
-                df = df.dropna(axis=0, how=missing_cfg.get("how", "any"))
-            metadata["missing_value"].update({"filled_columns": numeric_cols})
-
-        outlier_cfg = config.get("outlier", {})
-        if outlier_cfg:
-            method = outlier_cfg.get("method", "none")
-            if method != "none":
-                metadata.setdefault("outlier", {}).update({"method": method})
-                df, removed = _apply_outlier_limits(df, numeric_cols, method, outlier_cfg)
-                metadata["outlier"]["columns_affected"] = list(removed)
-
-        encoding_cfg = config.get("encoding", {})
-        encoding_strategy = encoding_cfg.get("strategy", "none")
-        if encoding_cfg and encoding_strategy != "none":
-            metadata.setdefault("encoding", {}).update(
-                {"strategy": encoding_strategy, "columns": categorical_cols}
-            )
-            df = _apply_encoding(df, encoding_strategy, categorical_cols, encoding_cfg)
-            numeric_cols, categorical_cols = _collect_column_groups(df)
-
-        scaling_cfg = config.get("scaling", {})
-        scaling_strategy = scaling_cfg.get("strategy", "none")
-        if scaling_cfg and scaling_strategy != "none":
-            metadata.setdefault("scaling", {}).update({"strategy": scaling_strategy})
-            df, scaler = _apply_scaling(df, scaling_strategy, numeric_cols, scaling_cfg)
-            if scaler is not None:
-                metadata["scaling"]["scaler"] = scaler.__class__.__name__ if hasattr(scaler, "__class__") else None
-
-        metadata["columns"] = list(df.columns)
-        return {"data": df, "metadata": metadata}
+        return _cached_preprocessing(
+            dataframe=df,
+            data_signature=data_signature,
+            dataset_id=dataset_id,
+            config_json=config_json,
+        )
