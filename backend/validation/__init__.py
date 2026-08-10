@@ -2,7 +2,16 @@
 
 from typing import Any, Dict
 
-__all__ = ["ValidationService"]
+from backend.validation.dataset_validation import (
+    DatasetValidationResult,
+    DatasetValidationService,
+)
+
+__all__ = [
+    "ValidationService",
+    "DatasetValidationResult",
+    "DatasetValidationService",
+]
 
 
 class ValidationService:
