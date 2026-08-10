@@ -2,8 +2,8 @@ import io
 import json
 import hashlib
 import threading
-from dataclasses import dataclass, field
-from typing import Any, Dict, Optional, Tuple
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import pandas as pd
 
@@ -18,6 +18,21 @@ class DatasetState:
     version: int = 0
     file_name: str = ""
     file_bytes: bytes = b""
+
+
+@dataclass
+class DatasetContext:
+    dataset_id: str
+    name: str
+    dataframe: pd.DataFrame
+    column_roles: Dict[str, List[str]]
+    available_columns: List[str]
+    required_roles: List[str]
+    role_config_snapshot: Dict[str, Any]
+    read_config_snapshot: Dict[str, Any]
+
+    def get_columns_for_role(self, role: str) -> List[str]:
+        return self.column_roles.get(role, [])
 
 
 # Global in-memory registry. In a real Streamlit app this would be backed by st.session_state
@@ -37,9 +52,63 @@ def _read_dataframe(file_bytes: bytes, file_name: str, config: Dict[str, Any]) -
     read_params = config.get("read_params", {})
     if lower.endswith(".csv"):
         return pd.read_csv(buffer, **read_params)
-    if lower.endswith( ".xls") or lower.endswith( ".xlsx") or lower.endswith(".xlsm"):
+    if lower.endswith(".xls") or lower.endswith(".xlsx") or lower.endswith(".xlsm"):
         return pd.read_excel(buffer, **read_params)
     raise ValueError(f"Unsupported file type for ingestion: {file_name}")
+
+
+def _ensure_column_list(value: Any) -> List[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, Sequence):
+        return [str(item) for item in value]
+    raise ValueError("Column role definitions must be a string or a sequence of strings.")
+
+
+def _normalize_column_roles(columns: Sequence[str], roles_config: Dict[str, Any]) -> Dict[str, List[str]]:
+    normalized: Dict[str, List[str]] = {}
+    available_columns = set(columns)
+    for role, raw in roles_config.items():
+        assigned = [item.strip() for item in _ensure_column_list(raw) if str(item).strip()]
+        if not assigned:
+            raise ValueError(f"Role '{role}' must reference at least one column.")
+        missing = [col for col in assigned if col not in available_columns]
+        if missing:
+            raise ValueError(
+                f"Role '{role}' references columns that do not exist in the dataset: {missing}"
+            )
+        seen: List[str] = []
+        for col in assigned:
+            if col not in seen:
+                seen.append(col)
+        normalized[role] = seen
+    return normalized
+
+
+def _ensure_required_roles(normalized_roles: Dict[str, List[str]], required_roles: Sequence[str]) -> None:
+    if not required_roles:
+        return
+    missing = [role for role in required_roles if not normalized_roles.get(role)]
+    if missing:
+        raise ValueError(
+            f"The following required roles have not been assigned columns in the configuration: {missing}"
+        )
+
+
+def _ensure_mapping(value: Any, name: str) -> Dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ValueError(f"'{name}' must be a mapping, but got {type(value).__name__}.")
+    return value
+
+
+def _ensure_sequence(value: Any, name: str) -> List[str]:
+    if value is None:
+        return []
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+        return [str(item) for item in value]
+    raise ValueError(f"'{name}' must be a sequence of strings, but got {type(value).__name__}.")
 
 
 def ingest_dataset(
@@ -140,3 +209,31 @@ def list_datasets() -> Dict[str, Tuple[str, int, str]]:
             dataset_id: (state.name, state.version, state.config_hash)
             for dataset_id, state in _DATASETS.items()
         }
+
+
+def build_dataset_context(dataset_id: str, config: Dict[str, Any]) -> DatasetContext:
+    """Constructs a DatasetContext that normalizes column roles for downstream services."""
+    if not isinstance(config, dict):
+        raise ValueError("'config' must be a mapping of configuration values.")
+    with _DATASETS_LOCK:
+        state = _DATASETS.get(dataset_id)
+        if state is None:
+            raise KeyError(f"Dataset '{dataset_id}' not registered")
+        dataframe = state.dataframe
+    columns = list(dataframe.columns)
+    role_definitions = _ensure_mapping(config.get("column_roles", {}), "column_roles")
+    required_roles = _ensure_sequence(config.get("required_roles", []), "required_roles")
+    normalized_roles = _normalize_column_roles(columns, role_definitions)
+    _ensure_required_roles(normalized_roles, required_roles)
+    read_params = _ensure_mapping(config.get("read_params", {}), "read_params")
+    context = DatasetContext(
+        dataset_id=dataset_id,
+        name=state.name,
+        dataframe=dataframe,
+        column_roles=normalized_roles,
+        available_columns=columns,
+        required_roles=required_roles,
+        role_config_snapshot=role_definitions,
+        read_config_snapshot=read_params,
+    )
+    return context
