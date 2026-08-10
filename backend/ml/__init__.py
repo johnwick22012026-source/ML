@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import pickle
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
@@ -14,6 +16,8 @@ from sklearn.ensemble import (
 from sklearn.linear_model import LogisticRegression, LinearRegression
 from sklearn.metrics import accuracy_score, mean_squared_error
 from sklearn.svm import SVC, SVR
+
+from backend.exports import ArtifactDescriptor, ExportService
 
 __all__ = ["MLService"]
 
@@ -89,6 +93,7 @@ class MLService:
         config: Dict[str, Any],
         features: FeatureMatrix,
         labels: TargetVector,
+        export_service: Optional[ExportService] = None,
     ) -> Dict[str, Any]:
         """Train configured models and return predictions with metadata."""
         runtime_config = self._normalize_config(config)
@@ -99,11 +104,14 @@ class MLService:
         model_results = []
 
         for model_config in models:
-            model_result = self._run_model(name=model_config["name"],
-                                           task_type=task_type,
-                                           hyperparameters=model_config.get("hyperparameters", {}),
-                                           X=X,
-                                           y=y)
+            model_result = self._run_model(
+                name=model_config["name"],
+                task_type=task_type,
+                hyperparameters=model_config.get("hyperparameters", {}),
+                X=X,
+                y=y,
+                export_service=export_service,
+            )
             model_results.append(model_result)
 
         metadata = {
@@ -121,6 +129,7 @@ class MLService:
         hyperparameters: Dict[str, Any],
         X: np.ndarray,
         y: np.ndarray,
+        export_service: Optional[ExportService],
     ) -> Dict[str, Any]:
         spec = ModelRegistry.get(name=name, task_type=task_type)
         estimator = spec.estimator_cls(**hyperparameters)
@@ -129,6 +138,13 @@ class MLService:
 
         predictions = self._to_list(raw_predictions)
         training_metadata = self._build_metadata(X, y, task_type, raw_predictions)
+        artifacts = self._build_artifacts(
+            export_service=export_service,
+            estimator=estimator,
+            predictions=predictions,
+            task_type=task_type,
+            model_name=name,
+        )
 
         return {
             "name": name,
@@ -140,6 +156,7 @@ class MLService:
             },
             "predictions": predictions,
             "training_metadata": training_metadata,
+            "artifacts": artifacts,
         }
 
     def _build_metadata(
@@ -161,6 +178,101 @@ class MLService:
             "trained_samples": len(X),
             "label_shape": len(y),
             "metrics": metrics,
+        }
+
+    def _build_artifacts(
+        self,
+        export_service: Optional[ExportService],
+        estimator: Any,
+        predictions: List[Any],
+        task_type: str,
+        model_name: str,
+    ) -> Dict[str, Any]:
+        serialized_model = self._serialize_estimator(estimator)
+        serialized_predictions = self._serialize_predictions(predictions)
+
+        model_artifact: Dict[str, Any] = {
+            "payload": serialized_model,
+            "payload_format": "pickle",
+            "file_name": f"{model_name}_model.pkl",
+            "artifact_descriptor": None,
+        }
+        prediction_artifact: Dict[str, Any] = {
+            "payload": serialized_predictions,
+            "payload_format": "json",
+            "file_name": f"{model_name}_predictions.json",
+            "artifact_descriptor": None,
+        }
+
+        if export_service:
+            model_descriptor = self._register_artifact(
+                export_service=export_service,
+                payload=serialized_model,
+                artifact_type="model",
+                file_name=model_artifact["file_name"],
+                metadata={
+                    "model_name": model_name,
+                    "task_type": task_type,
+                    "model_class": estimator.__class__.__name__,
+                },
+            )
+            prediction_descriptor = self._register_artifact(
+                export_service=export_service,
+                payload=serialized_predictions,
+                artifact_type="predictions",
+                file_name=prediction_artifact["file_name"],
+                metadata={
+                    "model_name": model_name,
+                    "task_type": task_type,
+                    "prediction_count": len(predictions),
+                },
+            )
+
+            if model_descriptor:
+                model_artifact["artifact_descriptor"] = model_descriptor
+                model_artifact["payload"] = None
+            if prediction_descriptor:
+                prediction_artifact["artifact_descriptor"] = prediction_descriptor
+                prediction_artifact["payload"] = None
+
+        return {
+            "model": model_artifact,
+            "predictions": prediction_artifact,
+        }
+
+    def _serialize_estimator(self, estimator: Any) -> bytes:
+        return pickle.dumps(estimator)
+
+    def _serialize_predictions(self, predictions: Sequence[Any]) -> bytes:
+        return json.dumps({"predictions": predictions}, default=str).encode("utf-8")
+
+    def _register_artifact(
+        self,
+        export_service: ExportService,
+        payload: bytes,
+        artifact_type: str,
+        file_name: str,
+        metadata: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        try:
+            descriptor = export_service.create(
+                payload=payload,
+                artifact_type=artifact_type,
+                file_name=file_name,
+                metadata=metadata,
+            )
+            return self._descriptor_to_dict(descriptor)
+        except Exception:
+            return None
+
+    def _descriptor_to_dict(self, descriptor: ArtifactDescriptor) -> Dict[str, Any]:
+        return {
+            "artifact_id": descriptor.artifact_id,
+            "artifact_type": descriptor.artifact_type,
+            "file_name": descriptor.file_name,
+            "payload_summary": descriptor.payload_summary,
+            "created_at": descriptor.created_at,
+            "metadata": descriptor.metadata,
         }
 
     def _prepare_data(
