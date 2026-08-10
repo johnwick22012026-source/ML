@@ -5,6 +5,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
+from backend.services.dataset_inspection import DatasetInspectionResult, inspect_dataset
 from backend.services.ingestion import (
     DatasetState,
     ingest_dataset,
@@ -37,48 +38,88 @@ def _generate_sample_frame() -> pd.DataFrame:
     return pd.DataFrame({"measurement_date": dates, "value": values.round(2), "category": categories})
 
 
-def _compute_quality_score(df: pd.DataFrame) -> float:
-    total_cells = df.size or 1
-    missing_cells = int(df.isna().sum().sum())
-    completeness_ratio = (total_cells - missing_cells) / total_cells
-    dup_rows = int(df.duplicated().sum())
-    uniqueness_ratio = 1.0 - (dup_rows / (len(df) or 1))
-    score = (completeness_ratio * 0.6 + uniqueness_ratio * 0.4) * 100
-    return max(0.0, min(100.0, round(score, 2)))
-
-
-def _summarize_dataframe(df: pd.DataFrame) -> Dict[str, Any]:
-    dims = (len(df), len(df.columns))
-    memory_usage_bytes = int(df.memory_usage(deep=True).sum())
-    missing = df.isna().sum()
-    duplicates = int(df.duplicated().sum())
-    quality_score = _compute_quality_score(df)
-    dtype_summary = (
-        df.dtypes.reset_index()
-        .rename(columns={"index": "column", 0: "dtype"})
-        .groupby("dtype")
-        .size()
-        .reset_index(name="count")
-    )
-    schema = df.dtypes.reset_index().rename(columns={"index": "column", 0: "dtype"})
-    return {
-        "dimensions": dims,
-        "memory": memory_usage_bytes,
-        "missing_values": missing.to_dict(),
-        "duplicate_rows": duplicates,
-        "quality_score": quality_score,
-        "dtype_summary": dtype_summary,
-        "schema": schema,
-    }
+def _refresh_inspection(state: Optional[DatasetState]) -> None:
+    if not state:
+        st.session_state["dataset_inspection"] = None
+        st.session_state["inspection_error"] = ""
+        return
+    try:
+        st.session_state["dataset_inspection"] = inspect_dataset(DATASET_ID, config=DEFAULT_INGEST_CONFIG)
+        st.session_state["inspection_error"] = ""
+    except Exception as exc:
+        st.session_state["dataset_inspection"] = None
+        st.session_state["inspection_error"] = f"Failed to inspect dataset: {exc}"
 
 
 def _update_session_state(state: Optional[DatasetState]) -> None:
     st.session_state["dataset_state"] = state
+    _refresh_inspection(state)
+
+
+def _render_inspection(inspect_result: DatasetInspectionResult) -> None:
+    st.subheader("Dataset Preview & Inspection")
+    preview_df = pd.DataFrame(inspect_result.preview.get("records", []))
+    if not preview_df.empty:
+        st.dataframe(preview_df, use_container_width=True)
+    else:
+        st.info("No preview records available")
+
+    dims = f"{inspect_result.row_count:,} rows × {inspect_result.column_count:,} columns"
+    st.markdown(f"**Dimensions:** {dims}")
+    metrics_col1, metrics_col2, metrics_col3 = st.columns(3)
+    metrics_col1.metric("Memory usage", f"{inspect_result.memory_usage_bytes:,} bytes")
+    metrics_col2.metric("Duplicate rows", f"{inspect_result.duplicate_row_count:,}")
+    metrics_col3.metric("Quality score", f"{inspect_result.quality_score * 100:.2f} / 100")
+
+    st.markdown("#### Schema")
+    st.table(pd.DataFrame(inspect_result.schema))
+
+    st.markdown("#### Datatype summary")
+    dtype_df = (
+        pd.DataFrame(
+            inspect_result.dtype_summary.items(), columns=["dtype", "count"]
+        )
+        .sort_values("count", ascending=False)
+        .reset_index(drop=True)
+    )
+    st.table(dtype_df)
+
+    st.markdown("#### Missing values")
+    missing_df = pd.DataFrame(
+        list(inspect_result.missing_value_counts.items()),
+        columns=["column", "missing_count"],
+    ).sort_values("missing_count", ascending=False)
+    st.table(missing_df)
+
+    st.markdown("#### Quality score breakdown")
+    inputs = inspect_result.quality_score_inputs
+    breakdown_df = pd.DataFrame(
+        {
+            "metric": [
+                "Missing ratio",
+                "Duplicate ratio",
+                "Rows",
+                "Columns",
+                "Missing values",
+                "Duplicate rows",
+            ],
+            "value": [
+                f"{inputs.missing_ratio:.4f}",
+                f"{inputs.duplicate_ratio:.4f}",
+                inputs.rows,
+                inputs.columns,
+                inputs.missing_values,
+                inputs.duplicate_rows,
+            ],
+        }
+    )
+    st.table(breakdown_df)
 
 
 if "dataset_state" not in st.session_state:
     st.session_state["dataset_state"] = None
-    st.session_state["status_message"] = ""
+    st.session_state["dataset_inspection"] = None
+    st.session_state["inspection_error"] = ""
 
 st.title("📊 Dataset Workspace")
 
@@ -174,50 +215,37 @@ with st.container():
 
 st.markdown("---")
 
-# Make dataset state and dataframe available for both panels
 state = st.session_state["dataset_state"]
-df = state.dataframe if state else None
+inspection = st.session_state["dataset_inspection"]
+inspection_error = st.session_state["inspection_error"]
 
-inspection_columns = st.columns([2, 1])
-with inspection_columns[0]:
-    st.markdown("### Dataset Preview & Insights")
+two_column_layout = st.columns([3, 1])
+with two_column_layout[0]:
     if not state:
         st.info("No dataset is available yet. Upload, replace, or load a sample dataset to continue.")
+    elif inspection_error:
+        st.error(inspection_error)
+    elif inspection:
+        _render_inspection(inspection)
     else:
-        st.dataframe(df.head(10), use_container_width=True)
-        summary = _summarize_dataframe(df)
-        dims = summary["dimensions"]
-        st.markdown(f"**Name:** {state.name}")
-        st.markdown(f"**Dimensions:** {dims[0]:,} rows × {dims[1]:,} columns")
-        dims_col1, dims_col2, dims_col3 = st.columns(3)
-        with dims_col1:
-            st.metric("Duplicate rows", f"{summary['duplicate_rows']}")
-        with dims_col2:
-            st.metric("Memory usage", f"{summary['memory']:,} bytes")
-        with dims_col3:
-            st.metric("Quality score", f"{summary['quality_score']} / 100")
-        st.markdown("#### Schema")
-        st.table(summary["schema"])
-        st.markdown("#### Datatype summary")
-        st.table(summary["dtype_summary"])
-        st.markdown("#### Missing values")
-        missing_df = pd.DataFrame(
-            list(summary["missing_values"].items()),
-            columns=["column", "missing_count"],
-        )
-        st.table(missing_df)
-with inspection_columns[1]:
-    st.markdown("### Sampling & Quick Stats")
-    if state:
+        st.warning("Dataset is loaded but inspection is pending.")
+
+with two_column_layout[1]:
+    st.subheader("Quick Sampling & Stats")
+    if state and inspection:
         sample_size = st.slider("Sample rows", min_value=5, max_value=100, value=10)
         if st.button("Generate random preview sample"):
             try:
-                sample_df = df.sample(n=min(sample_size, len(df)), random_state=42)
-                st.write(sample_df)
+                preview_df = pd.DataFrame(inspection.preview.get("records", []))
+                if preview_df.empty:
+                    st.warning("No data available for sampling yet.")
+                else:
+                    sampled = preview_df.sample(n=min(sample_size, len(preview_df)), replace=False, random_state=42)
+                    st.dataframe(sampled)
             except ValueError as exc:
                 st.warning(f"Unable to sample dataset: {exc}")
     else:
-        st.info("Sampling will become available once a dataset is loaded.")
+        st.info("Sampling will become available once a dataset is inspected.")
 
 analysis_section = st.container()
 with analysis_section:
