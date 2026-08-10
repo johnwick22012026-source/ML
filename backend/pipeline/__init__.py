@@ -1,89 +1,94 @@
-"""Pipeline orchestration layer for preprocessing driven entirely by configuration."""
+"""Orchestration layer that routes ML tasks to their proper pipelines."""
 
 from __future__ import annotations
 
-from dataclasses import asdict, is_dataclass
-from typing import Any, Dict, List
-
-from backend.config.contracts import PreprocessingConfig, build_section
-from backend.preprocessing import PreprocessingService
-from backend.validation import ValidationService
+from typing import Any, Callable, Dict
 
 __all__ = ["PipelineService"]
 
 
 class PipelineService:
-    """Orchestrates validation and preprocessing purely from a provided configuration."""
+    """Routes configuration-driven task execution to the correct pipeline."""
 
-    _REQUIRED_CONFIG_SECTIONS: List[str] = [
-        "data_settings",
-        "missing_value",
-        "outlier",
-        "encoding",
-        "scaling",
-        "feature_selection",
-    ]
-
-    def __init__(self, validation_service: ValidationService, preprocessing_service: PreprocessingService):
-        self._validation_service = validation_service
-        self._preprocessing_service = preprocessing_service
-
-    def run_preprocessing(
+    def __init__(
         self,
-        config: Dict[str, Any],
-        data: Any,
-        dataset_id: str = "",
-    ) -> Dict[str, Any]:
-        """Validate the configuration and dispatch to the preprocessing service."""
-        config = config or {}
-        validation_payload = {section: dict for section in self._REQUIRED_CONFIG_SECTIONS}
-        validation_result = self._validation_service.validate(config, validation_payload)
-        if not validation_result.get("is_valid"):
-            return {
-                "status": "invalid_config",
-                "errors": validation_result.get("errors", []),
-                "schema": list(validation_payload.keys()),
-            }
+        handlers: Optional[Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]]] = None,
+    ) -> None:
+        self._handlers: Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]] = {}
+        self._register_default_handlers()
+        if handlers:
+            for task_type, handler in handlers.items():
+                self.register_task(task_type, handler)
 
-        preprocessing_section = build_section(PreprocessingConfig, config)
-        if not preprocessing_section.enabled:
-            return {
-                "status": "skipped",
-                "metadata": {
-                    "reason": "Preprocessing is disabled in configuration.",
-                    "data_settings": self._to_plain_dict(preprocessing_section.data_settings),
-                },
-            }
+    def register_task(
+        self, task_type: str, handler: Callable[[Dict[str, Any]], Dict[str, Any]]
+    ) -> None:
+        """Register or override a task pipeline handler."""
+        normalized = task_type.strip().lower()
+        if not normalized:
+            raise ValueError("task_type must be a non-empty string")
+        self._handlers[normalized] = handler
 
-        payload = self._build_preprocessing_payload(preprocessing_section)
-        resolved_dataset_id = dataset_id or preprocessing_section.data_settings.dataset_id or "streamlit"
-        run_result = self._preprocessing_service.run(data, payload, dataset_id=resolved_dataset_id)
-        metadata = run_result.get("metadata", {})
-        metadata.setdefault("data_settings", self._to_plain_dict(preprocessing_section.data_settings))
-        metadata.setdefault("feature_selection", self._to_plain_dict(preprocessing_section.feature_selection))
-        run_result["metadata"] = metadata
+    def execute(self, config: Dict[str, Any]) -> Dict[str, Any]:
+        """Execute the pipeline associated with the configured task type."""
+        task_type = (config.get("task_type") or "").strip().lower()
+        if not task_type:
+            raise ValueError("Configuration must include a non-empty task_type session parameter.")
 
+        handler = self._handlers.get(task_type)
+        if handler is None:
+            supported = ", ".join(sorted(self._handlers.keys()))
+            raise ValueError(
+                f"Unknown task_type '{config.get('task_type')}'. Supported tasks: {supported}."
+            )
+
+        return handler(config)
+
+    @property
+    def supported_tasks(self) -> Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]]:
+        """Expose the currently registered tasks for introspection."""
+        return dict(self._handlers)
+
+    def _register_default_handlers(self) -> None:
+        self.register_task("regression", self._run_regression_pipeline)
+        self.register_task("classification", self._run_classification_pipeline)
+        self.register_task("clustering", self._run_clustering_pipeline)
+        self.register_task("forecasting", self._run_forecasting_pipeline)
+        self.register_task("anomaly_detection", self._run_anomaly_pipeline)
+
+    def _base_pipeline_payload(self, config: Dict[str, Any]) -> Dict[str, Any]:
         return {
-            "status": "complete",
-            "result": run_result,
-            "config": self._to_plain_dict(preprocessing_section),
+            "task_type": config.get("task_type"),
+            "config_snapshot": config,
+            "status": "executed",
         }
 
-    def _build_preprocessing_payload(self, section: PreprocessingConfig) -> Dict[str, Any]:
-        payload: Dict[str, Any] = {
-            "missing_value": self._to_plain_dict(section.missing_value),
-            "outlier": self._to_plain_dict(section.outlier),
-            "encoding": self._to_plain_dict(section.encoding),
-            "scaling": self._to_plain_dict(section.scaling),
-            "feature_selection": self._to_plain_dict(section.feature_selection),
-            "filters": list(section.filters),
-            "derived_fields": list(section.derived_fields),
-            "default_value": section.default_value,
-        }
+    def _run_regression_pipeline(self, config: Dict[str, Any]) -> Dict[str, Any]:
+        payload = self._base_pipeline_payload(config)
+        payload["pipeline"] = "regression"
+        payload["steps"] = ["ingestion", "validation", "preprocessing", "modeling", "evaluation"]
         return payload
 
-    @staticmethod
-    def _to_plain_dict(value: Any) -> Any:
-        if is_dataclass(value):
-            return asdict(value)
-        return value
+    def _run_classification_pipeline(self, config: Dict[str, Any]) -> Dict[str, Any]:
+        payload = self._base_pipeline_payload(config)
+        payload["pipeline"] = "classification"
+        payload["steps"] = ["ingestion", "balancing", "preprocessing", "modeling", "scoring"]
+        return payload
+
+    def _run_clustering_pipeline(self, config: Dict[str, Any]) -> Dict[str, Any]:
+        payload = self._base_pipeline_payload(config)
+        payload["pipeline"] = "clustering"
+        payload["steps"] = ["ingestion", "preprocessing", "feature_engineering", "clustering", "interpretation"]
+        return payload
+
+    def _run_forecasting_pipeline(self, config: Dict[str, Any]) -> Dict[str, Any]:
+        payload = self._base_pipeline_payload(config)
+        payload["pipeline"] = "forecasting"
+        payload["steps"] = ["time_series_conversion", "feature_engineering", "forecast_execution", "evaluation"]
+        return payload
+
+    def _run_anomaly_pipeline(self, config: Dict[str, Any]) -> Dict[str, Any]:
+        payload = self._base_pipeline_payload(config)
+        payload["pipeline"] = "anomaly_detection"
+        payload["steps"] = ["ingestion", "baseline_modeling", "anomaly_scoring", "alerting"]
+        return payload
